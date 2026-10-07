@@ -1,0 +1,20 @@
+# Web application
+Flask>=3.0
+
+# LLM providers and environment configuration
+boto3>=1.34
+openai>=1.30
+python-dotenv>=1.0
+pydantic>=2
+
+# CVE evidence engine and MCP server
+mcp>=1.9,<2
+lxml>=5,<7
+
+# Inventory and file integrations
+openpyxl>=3.1
+oracledb>=2.0
+paramiko>=5.0,<6.0
+
+# Test runner
+pytest>=8.0

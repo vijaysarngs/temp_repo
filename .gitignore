@@ -1,0 +1,29 @@
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+.venv/
+venv/
+
+# Frontend dependencies and generated bundle
+ui/node_modules/
+ui/dist/
+
+# Generated remediation/evidence artifacts
+aegis-cve-evidence/remediation/runs/
+aegis-cve-evidence/src/output_data/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

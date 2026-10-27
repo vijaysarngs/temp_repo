@@ -3,7 +3,7 @@
 import csv
 from pathlib import Path
 
-from cve_component_enrichment import COMPONENT_COLUMNS
+from cve_component_enrichment import COMPONENT_COLUMNS, component_identifier
 
 
 LIST_COLUMNS = {
@@ -22,12 +22,14 @@ def group_by_product_and_component(rows):
     """Combine CVEs only when both their product and component match."""
     groups = {}
     for row in rows:
-        key = (str(row.get("Product", "")).strip(),
-               str(row.get("Component", "")).strip())
+        product = str(row.get("Product", "")).strip()
+        component = str(row.get("Component", "")).strip()
+        key = (product, component)
         group = groups.setdefault(key, {
             column: [] if column in LIST_COLUMNS else str(row.get(column, "")).strip()
             for column in COMPONENT_COLUMNS
         })
+        group["Component ID"] = component_identifier(product, component)
         for column in LIST_COLUMNS:
             group[column].extend(_values(row.get(column, "")))
 

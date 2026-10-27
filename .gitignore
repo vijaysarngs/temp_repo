@@ -21,6 +21,17 @@ ui/dist/
 # Generated remediation/evidence artifacts
 aegis-cve-evidence/remediation/runs/
 aegis-cve-evidence/src/output_data/
+aegis-cve-evidence/Internet_lookup/tests_related_files/artifacts/
+aegis-cve-evidence/cache/
+aegis-cve-evidence/logs/
+aegis-cve-evidence/results/
+aegis-cve-evidence/context_gathered/Gathered_context/
+aegis-cve-evidence/context_gathered/inventory/raw/
+aegis-cve-evidence/context_gathered/inventory/disabled/
+data/selected_components_ui-*.csv
+data/ui-*.csv
+tools/callgraph/callgraph.html
+.claude/
 
 # Editor and OS files
 .vscode/

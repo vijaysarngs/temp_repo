@@ -19,7 +19,8 @@ if not (os.getenv("AWS_PROFILE") or "").strip():
 if not (os.getenv("AWS_DEFAULT_PROFILE") or "").strip():
     os.environ.pop("AWS_DEFAULT_PROFILE", None)
 
-if os.getenv("USE_BEDROCK", "true").lower() == "true":
+if (os.getenv("LLM_PROVIDER") or "").strip().lower() in ("", "bedrock") and \
+        os.getenv("USE_BEDROCK", "true").lower() == "true":
     os.environ.setdefault("MODEL_PROVIDER", "bedrock")
     os.environ.setdefault("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-5")
 os.environ.setdefault("DEMO_MODE", "0")
@@ -40,9 +41,25 @@ except Exception:
 # NVD API key (optional, increases rate limit from 5 req/30s to 50 req/30s)
 NVD_API_KEY = os.getenv("NVD_API_KEY", "")
 
-# LLM model selection
-USE_BEDROCK = os.getenv("USE_BEDROCK", "true").lower() == "true"
+# LLM provider: LLM_PROVIDER=bedrock|azure_openai is the one switch for every model call
+# (enrichment, remediation agent, Internet lookup, adapter fallback). USE_BEDROCK is only a
+# fallback for older .env files that set USE_BEDROCK=false without LLM_PROVIDER.
+LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or
+                ("bedrock" if os.getenv("USE_BEDROCK", "true").lower() == "true" else "azure_openai")
+                ).strip().strip('"').strip("'").lower()
+if LLM_PROVIDER not in ("bedrock", "azure_openai"):
+    raise ValueError(f"LLM_PROVIDER must be bedrock or azure_openai, not {LLM_PROVIDER!r}")
+os.environ["LLM_PROVIDER"] = LLM_PROVIDER    # the remediation agent and Internet lookup read it
+USE_BEDROCK = LLM_PROVIDER == "bedrock"
 BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID") or "global.anthropic.claude-sonnet-5"
+
+# Azure OpenAI (used when LLM_PROVIDER=azure_openai)
+AZURE_OPENAI_ENDPOINT = (os.getenv("AZURE_OPENAI_ENDPOINT") or "").strip().strip('"').strip("'")
+AZURE_OPENAI_API_KEY = (os.getenv("AZURE_OPENAI_API_KEY") or "").strip().strip('"').strip("'")
+AZURE_OPENAI_API_VERSION = (os.getenv("AZURE_OPENAI_API_VERSION") or "2024-02-01").strip()
+AZURE_CHAT_DEPLOYMENT = (os.getenv("AZURE_CHAT_DEPLOYMENT") or os.getenv("AZURE_OPENAI_DEPLOYMENT") or "").strip()
+# Newer reasoning deployments (o-series) take max_completion_tokens instead of max_tokens.
+AZURE_TOKEN_PARAMETER = (os.getenv("AZURE_TOKEN_PARAMETER") or "max_tokens").strip()
 AWS_DEFAULT_REGION = (os.getenv("AWS_DEFAULT_REGION") or "us-west-2").strip().strip('"').strip("'")
 
 # Cleanly extract AWS credentials in case there are surrounding quotes or spaces in .env

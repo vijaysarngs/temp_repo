@@ -10,6 +10,7 @@ or vulnerable on a host. Unresolved records require enrichment/review downstream
 
 import argparse
 import csv
+import hashlib
 import json
 import re
 import unicodedata
@@ -17,7 +18,7 @@ from pathlib import Path
 
 
 COMPONENT_COLUMNS = [
-    "Application", "Product", "Component", "Description", "CVE IDs",
+    "Application", "Product", "Component", "Component ID", "Description", "CVE IDs",
     "Operating System", "Technical Details", "Evidence",
     "Affected Symbol", "Source Path", "Component Kind",
     "Classification Status", "Classification Reason", "Source Rows",
@@ -38,6 +39,12 @@ CVE_PATTERN = re.compile(r"\bCVE-\d{4}-\d{4,}\b", re.IGNORECASE)
 
 def clean(value):
     return "" if value is None else str(value).strip()
+
+
+def component_identifier(product, component):
+    """Return a stable identifier for one exact product/component group."""
+    identity = f"{clean(product)}\x1f{clean(component)}".encode("utf-8")
+    return "CMP-" + hashlib.sha256(identity).hexdigest()[:24].upper()
 
 
 def normalized(value):
@@ -203,8 +210,8 @@ Return only through submit_detailed_component_classifications.
 
 def classify_batch(client, records, max_tokens=6000, retry_feedback=None):
     # Keep your existing model, region, credentials, and retry configuration.
-    from agent_utils import invoke_bedrock
-    return invoke_bedrock(client, {
+    from agent_utils import invoke_llm
+    return invoke_llm(client, {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": [{
@@ -381,7 +388,7 @@ def classify_cves(client, records, batch_size=5, max_batches=None, max_tokens=60
             output = {}
             for record in batch:
                 result = empty_result(record["cve_id"])
-                result.update(status="MODEL_ERROR", issues=[f"Bedrock call failed: {type(exc).__name__}; check provider configuration/logs"])
+                result.update(status="MODEL_ERROR", issues=[f"Model call failed: {type(exc).__name__}; check provider configuration/logs"])
                 output[record["cve_id"]] = result
             return output
 
@@ -424,6 +431,7 @@ def component_rows(records, classifications):
             row = {
                 "Application": context["application"], "Product": product,
                 "Component": component, "Operating System": context["operating_system"],
+                "Component ID": component_identifier(product, component),
                 "Description": f"Source-named component: {component}." if result["component"]["label"] else "No stable component explicitly identified in the source.",
                 "Component Kind": result["component_kind"],
                 "Classification Status": result["status"],
@@ -502,8 +510,8 @@ def main():
     } for record in records], ["CVE ID", "Descriptions", "Contexts", "Source Rows"])
     client = None
     if any(source for record in records for source in record["sources"] if not source["shared_cve_ids"]):
-        from agent_utils import create_bedrock_client
-        client = create_bedrock_client()
+        from agent_utils import create_llm_client
+        client = create_llm_client()
     results = classify_cves(client, records, args.batch_size, args.max_batches,
                             args.max_tokens, diagnostics["attempts"])
     diagnostics["classifications"] = results

@@ -11,7 +11,7 @@ import json
 import re
 from pathlib import Path
 
-from agent_utils import clean, create_bedrock_client, get_value, invoke_bedrock
+from agent_utils import clean, create_llm_client, get_value, invoke_llm
 
 
 INPUT_COLUMNS = [
@@ -106,7 +106,7 @@ Rules:
 Input record:
 {context}
 """.strip()
-    result = invoke_bedrock(client, {
+    result = invoke_llm(client, {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 800,
         "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
@@ -116,7 +116,7 @@ Input record:
     for block in result.get("content", []):
         if block.get("type") == "tool_use" and block.get("name") == COMMAND_TOOL["name"]:
             return block.get("input")
-    raise ValueError("Bedrock did not return a version probe")
+    raise ValueError("The model did not return a version probe")
 
 
 def validate_probe(probe):
@@ -189,7 +189,7 @@ def build_command_rows(rows):
         else:
             try:
                 if client is None:
-                    client = create_bedrock_client()
+                    client = create_llm_client()
                 probe = generate_probe(client, enriched)
                 validate_probe(probe)
                 output["Version Target"] = clean(probe["version_target"])

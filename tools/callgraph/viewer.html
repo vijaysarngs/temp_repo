@@ -1,0 +1,818 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aegis Call Graph</title>
+<style>
+:root {
+  --bg: #f6f6f3; --panel: #ffffff; --panel-2: #fafaf8; --ink: #1c1c1a; --muted: #6a6a64; --faint: #a3a39c;
+  --line: #e2e1db; --accent: #2a64d6; --accent-ink: #ffffff; --hl: #e0901f; --chip: #efeee9;
+  --code-bg: #fbfbf9; --code-hl: #fff1d6; --code-hl-strong: #ffe2a8;
+  --e-call: #8d8d86; --e-dispatch: #8a5cd0; --e-inferred: #d9822b; --e-ref: #1f9a8a; --e-http: #2a64d6;
+  --file-bg: #1c1c1a; --file-alpha: 0.035; --file-line: #d8d7d0;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #151514; --panel: #1d1d1b; --panel-2: #212120; --ink: #ebebe6; --muted: #a2a29a; --faint: #6b6b65;
+    --line: #33332f; --accent: #6b9cff; --accent-ink: #0e1a33; --hl: #f2a640; --chip: #2a2a27;
+    --code-bg: #191918; --code-hl: #3a2f18; --code-hl-strong: #5a4214;
+    --e-call: #77776f; --e-dispatch: #a98bea; --e-inferred: #e69a4f; --e-ref: #3cbfae; --e-http: #6b9cff;
+    --file-bg: #ffffff; --file-alpha: 0.04; --file-line: #3a3a36;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #151514; --panel: #1d1d1b; --panel-2: #212120; --ink: #ebebe6; --muted: #a2a29a; --faint: #6b6b65;
+  --line: #33332f; --accent: #6b9cff; --accent-ink: #0e1a33; --hl: #f2a640; --chip: #2a2a27;
+  --code-bg: #191918; --code-hl: #3a2f18; --code-hl-strong: #5a4214;
+  --e-call: #77776f; --e-dispatch: #a98bea; --e-inferred: #e69a4f; --e-ref: #3cbfae; --e-http: #6b9cff;
+  --file-bg: #ffffff; --file-alpha: 0.04; --file-line: #3a3a36;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--ink); font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+button, input, select { font: inherit; color: inherit; }
+code, pre, .mono { font-family: ui-monospace, "Cascadia Code", Consolas, Menlo, monospace; }
+
+.app { display: grid; grid-template-rows: auto 1fr; height: 100vh; }
+header { display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+header h1 { font-size: 14px; margin: 0; font-weight: 650; letter-spacing: .01em; }
+header .meta { color: var(--muted); font-size: 12px; }
+.spacer { flex: 1; }
+.search { position: relative; width: min(420px, 100%); flex: 1 1 220px; }
+.search input { width: 100%; padding: 6px 10px 6px 28px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-2); outline: none; }
+.search input:focus { border-color: var(--accent); }
+.search svg { position: absolute; left: 8px; top: 50%; transform: translateY(-50%); color: var(--faint); }
+.results { position: absolute; top: calc(100% + 4px); left: 0; right: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.15); max-height: 60vh; overflow: auto; z-index: 20; display: none; }
+.results.open { display: block; }
+.results div { padding: 6px 10px; cursor: pointer; display: flex; gap: 8px; align-items: baseline; }
+.results div.active, .results div:hover { background: var(--chip); }
+.results .f { color: var(--muted); font-size: 11px; margin-left: auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 55%; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+.seg button { border: 0; background: transparent; padding: 5px 10px; cursor: pointer; }
+.seg button.on { background: var(--accent); color: var(--accent-ink); }
+.btn { border: 1px solid var(--line); background: var(--panel-2); padding: 5px 10px; border-radius: 7px; cursor: pointer; }
+.btn:hover { border-color: var(--faint); }
+.btn.small { padding: 2px 8px; font-size: 12px; }
+
+.main { display: grid; grid-template-columns: 290px 1fr 400px; min-height: 0; }
+aside { background: var(--panel); min-height: 0; overflow: auto; }
+aside.left { border-right: 1px solid var(--line); }
+aside.right { border-left: 1px solid var(--line); overflow-x: hidden; }
+.tabs { display: flex; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--panel); z-index: 2; }
+.tabs button { flex: 1; border: 0; background: transparent; padding: 9px; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent; }
+.tabs button.on { color: var(--ink); border-bottom-color: var(--accent); }
+.section { padding: 10px 12px; border-bottom: 1px solid var(--line); }
+.section h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 6px; font-weight: 600; }
+label.row { display: flex; align-items: center; gap: 7px; padding: 2px 0; cursor: pointer; }
+.row .count { margin-left: auto; color: var(--faint); font-size: 11px; }
+.swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+.area { margin-bottom: 4px; }
+.area > .head { display: flex; align-items: center; gap: 7px; padding: 3px 0; cursor: pointer; font-weight: 600; }
+.area > .head .caret { width: 12px; color: var(--faint); transition: transform .15s; }
+.area.collapsed > .head .caret { transform: rotate(-90deg); }
+.area.collapsed > .files { display: none; }
+.area .files { padding-left: 19px; }
+.area .files label { font-size: 12px; }
+.area .files label span.name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.legend-line { display: inline-block; width: 22px; height: 0; border-top: 2px solid; vertical-align: middle; }
+.depth { display: flex; gap: 8px; align-items: center; }
+.depth input { width: 100%; }
+
+.list-item { display: flex; gap: 6px; align-items: baseline; padding: 3px 4px; border-radius: 5px; cursor: pointer; }
+.list-item:hover { background: var(--chip); }
+.list-item .n { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.list-item .f { color: var(--muted); font-size: 11px; margin-left: auto; white-space: nowrap; flex: none; }
+.empty { color: var(--faint); font-style: italic; padding: 2px 4px; }
+
+.stage { position: relative; min-width: 0; min-height: 0; }
+#cy { position: absolute; inset: 0; }
+.overlay { position: absolute; left: 12px; top: 10px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; z-index: 5; pointer-events: none; }
+.overlay > * { pointer-events: auto; }
+.crumb { background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 4px 10px; color: var(--muted); }
+.crumb b { color: var(--ink); }
+.zoom { position: absolute; right: 12px; bottom: 12px; display: flex; flex-direction: column; gap: 4px; z-index: 5; }
+.zoom .btn { width: 32px; height: 32px; padding: 0; background: var(--panel); }
+.busy { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; color: var(--muted); z-index: 6; background: color-mix(in srgb, var(--bg) 60%, transparent); }
+.busy.on { display: flex; }
+.hint { position: absolute; left: 12px; bottom: 12px; color: var(--faint); font-size: 12px; z-index: 5; }
+
+.detail { padding: 14px; }
+.detail h2 { font-size: 16px; margin: 0 0 2px; word-break: break-word; }
+.detail .where { color: var(--muted); font-size: 12px; word-break: break-all; }
+.badges { display: flex; gap: 5px; flex-wrap: wrap; margin: 8px 0; }
+.badge { font-size: 11px; padding: 1px 7px; border-radius: 99px; background: var(--chip); color: var(--muted); }
+.badge.entry { background: color-mix(in srgb, var(--e-ref) 18%, transparent); color: var(--e-ref); }
+.badge.route { background: color-mix(in srgb, var(--e-http) 18%, transparent); color: var(--e-http); }
+.badge.warn { background: color-mix(in srgb, var(--e-inferred) 18%, transparent); color: var(--e-inferred); }
+.sig { background: var(--code-bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font-size: 12px; word-break: break-word; margin: 6px 0; }
+.doc { color: var(--muted); white-space: pre-wrap; margin: 6px 0; }
+.actions { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0 4px; }
+.kind { font-size: 10px; padding: 0 5px; border-radius: 4px; border: 1px solid currentColor; flex: none; text-transform: uppercase; letter-spacing: .03em; }
+.k-call { color: var(--e-call); } .k-dispatch { color: var(--e-dispatch); } .k-inferred { color: var(--e-inferred); }
+.k-ref { color: var(--e-ref); } .k-http { color: var(--e-http); }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.chip { font-size: 11px; background: var(--chip); padding: 1px 6px; border-radius: 4px; color: var(--muted); }
+.code { max-width: 100%; background: var(--code-bg); border: 1px solid var(--line); border-radius: 6px; font-size: 11.5px; overflow: auto; max-height: 52vh; }
+.code table { border-collapse: collapse; width: 100%; }
+.code td { padding: 0 8px; white-space: pre; vertical-align: top; }
+.code td.ln { color: var(--faint); text-align: right; user-select: none; width: 1%; border-right: 1px solid var(--line); }
+.code tr.hl td { background: var(--code-hl); }
+.code tr.hl2 td { background: var(--code-hl-strong); }
+.code tr.hl td.ln, .code tr.hl2 td.ln { color: var(--ink); }
+.pathbar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.pathbar .slot { border: 1px dashed var(--line); border-radius: 6px; padding: 2px 8px; color: var(--muted); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pathbar .slot.set { border-style: solid; color: var(--ink); }
+.toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--bg); padding: 6px 14px; border-radius: 8px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 50; }
+.toast.on { opacity: .92; }
+kbd { font-family: inherit; font-size: 11px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; background: var(--panel-2); }
+
+@media (max-width: 1100px) { .main { grid-template-columns: 250px 1fr 340px; } }
+@media (max-width: 860px) {
+  body { overflow: auto; }
+  .app { height: auto; }
+  .main { grid-template-columns: 1fr; }
+  .stage { height: 70vh; order: -1; }
+  aside.left, aside.right { border: 0; border-top: 1px solid var(--line); }
+  header { padding: 8px 16px; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>Aegis call graph</h1>
+    <span class="meta" id="meta"></span>
+    <div class="spacer"></div>
+    <div class="search">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input id="q" placeholder="Search functions, methods, files…  ( / )" autocomplete="off" spellcheck="false">
+      <div class="results" id="results"></div>
+    </div>
+    <div class="seg" id="viewSeg">
+      <button data-view="map" class="on" title="Every visible function, grouped by file">Map</button>
+      <button data-view="focus" title="Callers and callees of the selected function">Focus</button>
+    </div>
+    <button class="btn" id="themeBtn" title="Toggle light / dark">◐</button>
+  </header>
+
+  <div class="main">
+    <aside class="left">
+      <div class="tabs" id="leftTabs">
+        <button data-tab="filters" class="on">Filters</button>
+        <button data-tab="insights">Debug insights</button>
+      </div>
+      <div id="tab-filters">
+        <div class="section">
+          <h3>Show</h3>
+          <label class="row"><input type="checkbox" id="optTests"> Test code <span class="count" id="cntTests"></span></label>
+          <label class="row"><input type="checkbox" id="optModule" checked> Module-level code (<span class="mono">&lt;module&gt;</span>)</label>
+          <label class="row"><input type="checkbox" id="optIsolated"> Functions with no edges (map)</label>
+        </div>
+        <div class="section">
+          <h3>Edge types</h3>
+          <div id="edgeKinds"></div>
+        </div>
+        <div class="section">
+          <h3>Focus depth</h3>
+          <div class="depth"><span style="width:62px">Callers</span><input type="range" id="depthUp" min="0" max="6" value="1"><b id="depthUpV">1</b></div>
+          <div class="depth"><span style="width:62px">Callees</span><input type="range" id="depthDown" min="0" max="8" value="2"><b id="depthDownV">2</b></div>
+        </div>
+        <div class="section">
+          <h3 style="display:flex">Files <span class="spacer"></span>
+            <a href="#" id="allFiles" style="color:var(--accent);text-transform:none;letter-spacing:0">all</a>&nbsp;·&nbsp;<a href="#" id="noFiles" style="color:var(--accent);text-transform:none;letter-spacing:0">none</a></h3>
+          <div id="fileTree"></div>
+        </div>
+      </div>
+      <div id="tab-insights" hidden>
+        <div class="section">
+          <h3>Call path finder</h3>
+          <div class="pathbar"><span class="slot" id="pathA">from: pick a node</span><span>→</span><span class="slot" id="pathB">to: pick a node</span></div>
+          <div class="actions"><button class="btn small" id="pathGo">Find path</button><button class="btn small" id="pathClear">Clear</button></div>
+          <div style="color:var(--muted);font-size:12px">Select a function, then use “Path from / to” in the details panel. Shortest chain of calls is shown.</div>
+        </div>
+        <div id="insights"></div>
+      </div>
+    </aside>
+
+    <section class="stage">
+      <div id="cy"></div>
+      <div class="overlay" id="overlay"></div>
+      <div class="hint" id="hint">Click a node for details · double-click to focus · <kbd>/</kbd> search · <kbd>Esc</kbd> clear</div>
+      <div class="zoom">
+        <button class="btn" id="zIn" title="Zoom in">+</button>
+        <button class="btn" id="zOut" title="Zoom out">−</button>
+        <button class="btn" id="zFit" title="Fit">⤢</button>
+      </div>
+      <div class="busy" id="busy">Laying out graph…</div>
+    </section>
+
+    <aside class="right"><div class="detail" id="detail"></div></aside>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/layout-base@2.0.1/layout-base.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/cose-base@2.2.0/cose-base.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/cytoscape-fcose@2.2.0/cytoscape-fcose.js"></script>
+<script>
+const DATA = /*__GRAPH_DATA__*/null;
+
+// ------------------------------------------------------------------ indexes
+const byId = new Map(DATA.nodes.map(n => [n.id, n]));
+const outE = new Map(), inE = new Map();
+for (const e of DATA.edges) {
+  (outE.get(e.s) || outE.set(e.s, []).get(e.s)).push(e);
+  (inE.get(e.t) || inE.set(e.t, []).get(e.t)).push(e);
+}
+const KINDS = {
+  call:     { label: "call",     desc: "direct call" },
+  dispatch: { label: "dispatch", desc: "self.m() → subclass override" },
+  inferred: { label: "inferred", desc: "guessed from unique method name" },
+  ref:      { label: "ref",      desc: "passed as callback / reference" },
+  http:     { label: "http",     desc: "UI fetch → API route" },
+};
+const AREAS = [...new Set(DATA.nodes.map(n => n.area))].sort((a, b) => a === "tests" ? 1 : b === "tests" ? -1 : a.localeCompare(b));
+const PALETTE = {
+  light: ["#2a64d6", "#d9662b", "#1f9a6a", "#b0399c", "#8a6d12", "#4b4fc4", "#c43a4a", "#1c8aa6", "#6f7d2a", "#8a8a82"],
+  dark:  ["#6b9cff", "#f08a4f", "#45c48f", "#dc6ac6", "#d0b04a", "#8f92f0", "#f06b78", "#4cc3dd", "#a7b552", "#9d9d95"],
+};
+const state = {
+  view: "map", selected: null, edgeSel: null,
+  tests: false, module: true, isolated: false,
+  kinds: { call: true, dispatch: true, inferred: true, ref: true, http: true },
+  up: 1, down: 2, hiddenFiles: new Set(), pathA: null, pathB: null, path: null,
+};
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const theme = () => {
+  const t = document.documentElement.dataset.theme;
+  return t || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+};
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const areaColor = a => PALETTE[theme()][AREAS.indexOf(a) % PALETTE.light.length];
+const label = n => {
+  if (n.kind === "module") return `<module> ${n.file.split("/").pop()}`;
+  const parts = n.qual.split(".");
+  return parts.length > 2 ? parts.slice(-2).join(".") : n.qual;
+};
+const shortFile = f => f.length > 46 ? "…" + f.slice(-45) : f;
+function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("on"); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove("on"), 1600); }
+
+function visible(n) {
+  if (!n) return false;
+  if (!state.tests && n.test) return false;
+  if (!state.module && n.kind === "module") return false;
+  return !state.hiddenFiles.has(n.file);
+}
+const edgeOn = e => state.kinds[e.k];
+
+// ------------------------------------------------------------------ insights (computed once)
+const insights = (() => {
+  const inbound = id => (inE.get(id) || []);
+  const nonTest = DATA.nodes.filter(n => !n.test);
+  const entries = nonTest.filter(n => n.entry && n.kind !== "module");
+  const dead = nonTest.filter(n => n.kind !== "module" && !n.entry && !n.property && !inbound(n.id).length
+    && !/^__\w+__$/.test(n.name) && !(n.decorators || []).length && n.kind !== "hook");
+  const fanIn = nonTest.map(n => [n, new Set(inbound(n.id).filter(e => e.k !== "ref").map(e => e.s)).size])
+    .filter(x => x[1] > 1).sort((a, b) => b[1] - a[1]).slice(0, 15);
+  const fanOut = nonTest.map(n => [n, new Set((outE.get(n.id) || []).map(e => e.t)).size])
+    .filter(x => x[1] > 4).sort((a, b) => b[1] - a[1]).slice(0, 12);
+  // Tarjan SCC over call/dispatch edges -> recursion & cycles
+  let idx = 0; const index = new Map(), low = new Map(), stack = [], on = new Set(), sccs = [];
+  const succ = id => (outE.get(id) || []).filter(e => e.k === "call" || e.k === "dispatch").map(e => e.t);
+  function strong(v) {
+    const work = [[v, 0]]; index.set(v, idx); low.set(v, idx); idx++; stack.push(v); on.add(v);
+    while (work.length) {
+      const top = work[work.length - 1]; const [u, i] = top; const s = succ(u);
+      if (i < s.length) {
+        top[1]++; const w = s[i];
+        if (!index.has(w)) { index.set(w, idx); low.set(w, idx); idx++; stack.push(w); on.add(w); work.push([w, 0]); }
+        else if (on.has(w)) low.set(u, Math.min(low.get(u), index.get(w)));
+      } else {
+        work.pop();
+        if (work.length) { const p = work[work.length - 1][0]; low.set(p, Math.min(low.get(p), low.get(u))); }
+        if (low.get(u) === index.get(u)) {
+          const comp = []; let w; do { w = stack.pop(); on.delete(w); comp.push(w); } while (w !== u);
+          if (comp.length > 1 || succ(u).includes(u)) sccs.push(comp);
+        }
+      }
+    }
+  }
+  for (const n of DATA.nodes) if (!index.has(n.id)) strong(n.id);
+  const http = DATA.edges.filter(e => e.k === "http");
+  return { entries, dead, fanIn, fanOut, sccs, http };
+})();
+
+// ------------------------------------------------------------------ cytoscape
+if (window.cytoscapeDagre) try { cytoscape.use(cytoscapeDagre); } catch (_) {}
+if (window.cytoscapeFcose) try { cytoscape.use(cytoscapeFcose); } catch (_) {}
+
+function cyStyle() {
+  const ink = css("--ink"), muted = css("--muted"), bg = css("--bg"), hl = css("--hl");
+  return [
+    { selector: "node", style: { "label": "data(label)", "color": ink, "font-size": 10,
+      "text-valign": "bottom", "text-margin-y": 3,
+      "text-outline-color": bg, "text-outline-width": 2, "min-zoomed-font-size": 7,
+      "border-width": 0, "text-wrap": "ellipsis", "text-max-width": 160 } },
+    { selector: "node[color]", style: { "background-color": "data(color)" } },
+    { selector: "node[size]", style: { "width": "data(size)", "height": "data(size)" } },
+    { selector: "node.entry", style: { "shape": "round-diamond" } },
+    { selector: "node.module", style: { "shape": "round-rectangle" } },
+    { selector: "node.test", style: { "opacity": 0.75, "border-width": 1, "border-style": "dashed", "border-color": muted } },
+    { selector: "node.file", style: {
+      "background-color": css("--file-bg"), "background-opacity": +css("--file-alpha") || 0.04, "border-width": 1, "border-color": css("--file-line"),
+      "shape": "round-rectangle", "label": "data(label)", "text-valign": "top", "text-halign": "center",
+      "font-size": 11, "color": muted, "text-margin-y": -4, "padding": 10, "text-outline-width": 0, "text-max-width": 400 } },
+    { selector: "edge", style: {
+      "width": 1.2, "line-color": css("--e-call"), "target-arrow-color": css("--e-call"), "target-arrow-shape": "triangle",
+      "arrow-scale": 0.8, "curve-style": "bezier", "opacity": 0.65 } },
+    { selector: "edge.dispatch", style: { "line-color": css("--e-dispatch"), "target-arrow-color": css("--e-dispatch"), "line-style": "dashed" } },
+    { selector: "edge.inferred", style: { "line-color": css("--e-inferred"), "target-arrow-color": css("--e-inferred"), "line-style": "dotted", "width": 1.6 } },
+    { selector: "edge.ref", style: { "line-color": css("--e-ref"), "target-arrow-color": css("--e-ref"), "line-style": "dashed", "target-arrow-shape": "vee" } },
+    { selector: "edge.http", style: { "line-color": css("--e-http"), "target-arrow-color": css("--e-http"), "width": 2.4, "opacity": 0.9 } },
+    { selector: "node.big", style: { "font-size": 12, "min-zoomed-font-size": 0, "text-max-width": 220 } },
+    { selector: ".faded", style: { "opacity": 0.08, "text-opacity": 0 } },
+    { selector: "node.file.faded", style: { "opacity": 0.35, "text-opacity": 0.5 } },
+    { selector: "edge.lit", style: { "opacity": 1, "width": 2.2, "z-index": 10 } },
+    { selector: "node.lit", style: { "font-weight": 600, "z-index": 10 } },
+    { selector: "node.sel", style: { "border-width": 3, "border-color": hl, "border-style": "solid", "font-weight": 700, "font-size": 12, "z-index": 20 } },
+    { selector: "edge.sel", style: { "line-color": hl, "target-arrow-color": hl, "width": 3.5, "opacity": 1, "z-index": 20 } },
+    { selector: "node.onpath", style: { "border-width": 3, "border-color": hl, "border-style": "solid" } },
+    { selector: "edge.onpath", style: { "line-color": hl, "target-arrow-color": hl, "width": 3, "opacity": 1 } },
+  ];
+}
+
+const cy = cytoscape({ container: $("cy"), wheelSensitivity: 0.25, minZoom: 0.05, maxZoom: 4, style: cyStyle(), boxSelectionEnabled: false });
+
+function nodeEl(n, parent, big = false) {
+  const deg = (inE.get(n.id) || []).length;
+  const classes = [n.kind, n.entry ? "entry" : "", n.test ? "test" : "", big ? "big" : ""].filter(Boolean).join(" ");
+  return { group: "nodes", data: { id: n.id, label: label(n), color: areaColor(n.area), size: Math.min(34, 12 + Math.sqrt(deg) * 4), parent }, classes };
+}
+function edgeEls(ids) {
+  const out = [];
+  for (const id of ids) for (const e of (outE.get(id) || [])) {
+    if (!edgeOn(e) || !ids.has(e.t)) continue;
+    out.push({ group: "edges", data: { id: `${e.k}|${e.s}|${e.t}`, source: e.s, target: e.t }, classes: e.k });
+  }
+  return out;
+}
+
+let layoutRun = null;
+function runLayout(name, opts = {}) {
+  if (layoutRun) layoutRun.stop();
+  $("busy").classList.add("on");
+  return new Promise(resolve => {
+    requestAnimationFrame(() => {
+      let options;
+      if (name === "fcose" && window.cytoscapeFcose) options = { name: "fcose", quality: "default", randomize: true, animate: false,
+        nodeRepulsion: 9000, idealEdgeLength: 70, edgeElasticity: 0.3, nestingFactor: 0.15, gravity: 0.3, gravityRangeCompound: 1.6,
+        gravityCompound: 1.2, numIter: 2500, packComponents: true, tile: true, tilingPaddingVertical: 20, tilingPaddingHorizontal: 20, nodeDimensionsIncludeLabels: true };
+      else if (name === "dagre" && window.dagre) options = { name: "dagre", rankDir: "LR", nodeSep: 22, rankSep: 150, edgeSep: 6, animate: false, nodeDimensionsIncludeLabels: true };
+      else options = { name: "cose", animate: false };
+      layoutRun = cy.layout(Object.assign(options, opts));
+      layoutRun.one("layoutstop", () => { $("busy").classList.remove("on"); resolve(); });
+      layoutRun.run();
+    });
+  });
+}
+
+// ------------------------------------------------------------------ views
+async function render({ keepViewport = false } = {}) {
+  const els = [];
+  let layout;
+  if (state.path) {
+    const ids = new Set(state.path);
+    state.path.forEach(id => els.push(nodeEl(byId.get(id), undefined, true)));
+    els.push(...edgeEls(ids));
+    layout = "dagre";
+  } else if (state.view === "focus" && state.selected) {
+    const ids = neighborhood(state.selected, state.up, state.down);
+    ids.forEach(id => els.push(nodeEl(byId.get(id), undefined, true)));
+    els.push(...edgeEls(ids));
+    layout = "dagre";
+  } else {
+    const nodes = DATA.nodes.filter(visible);
+    const ids = new Set(nodes.map(n => n.id));
+    const edges = edgeEls(ids);
+    const connected = new Set(edges.flatMap(e => [e.data.source, e.data.target]));
+    const shown = nodes.filter(n => state.isolated || connected.has(n.id) || n.id === state.selected);
+    const files = new Set(shown.map(n => n.file));
+    files.forEach(f => els.push({ group: "nodes", data: { id: "file:" + f, label: f }, classes: "file" }));
+    shown.forEach(n => els.push(nodeEl(n, "file:" + n.file)));
+    const shownIds = new Set(shown.map(n => n.id));
+    els.push(...edges.filter(e => shownIds.has(e.data.source) && shownIds.has(e.data.target)));
+    layout = "fcose";
+  }
+  cy.startBatch(); cy.elements().remove(); cy.add(els); cy.endBatch();
+  updateOverlay();
+  await runLayout(layout);
+  applyHighlight();
+  if (!keepViewport) {
+    const sel = state.selected && cy.getElementById(state.selected);
+    if (state.view === "map" && sel && sel.length && !state.path) cy.animate({ fit: { eles: sel.closedNeighborhood(), padding: 80 } }, { duration: 250 });
+    else {
+      cy.fit(undefined, 40);
+      const sel2 = state.selected && cy.getElementById(state.selected);
+      if (cy.zoom() < 0.6 && !state.path && layout === "dagre" && sel2 && sel2.length) cy.zoom({ level: 0.6, position: sel2.position() });
+    }
+  }
+}
+
+function neighborhood(id, up, down) {
+  const ids = new Set([id]);
+  const walk = (start, depth, dir) => {
+    let frontier = [start];
+    for (let d = 0; d < depth; d++) {
+      const next = [];
+      for (const v of frontier) for (const e of ((dir === "out" ? outE : inE).get(v) || [])) {
+        if (!edgeOn(e)) continue;
+        const w = dir === "out" ? e.t : e.s;
+        if (!visible(byId.get(w)) && w !== id) continue;
+        if (!ids.has(w)) { ids.add(w); next.push(w); }
+      }
+      frontier = next;
+    }
+  };
+  walk(id, up, "in"); walk(id, down, "out");
+  return ids;
+}
+
+function applyHighlight() {
+  cy.elements().removeClass("faded lit sel onpath");
+  if (state.path) {
+    cy.nodes().addClass("onpath");
+    for (let i = 0; i + 1 < state.path.length; i++) cy.edges(`[source = "${CSS.escape(state.path[i])}"][target = "${CSS.escape(state.path[i + 1])}"]`).addClass("onpath");
+  }
+  if (state.edgeSel) {
+    const e = cy.getElementById(state.edgeSel);
+    if (e.length) { cy.elements().not(e.connectedNodes()).not(e).not("node.file").addClass("faded"); e.addClass("sel"); e.connectedNodes().addClass("lit"); }
+    return;
+  }
+  if (!state.selected) return;
+  const n = cy.getElementById(state.selected);
+  if (!n.length) return;
+  n.addClass("sel");
+  if (state.view === "map" && !state.path) {
+    const keep = n.closedNeighborhood();
+    cy.elements().not(keep).not(keep.parents()).addClass("faded");
+    keep.parents().removeClass("faded");
+    n.connectedEdges().addClass("lit");
+  }
+}
+
+function updateOverlay() {
+  const o = $("overlay");
+  if (state.path) {
+    o.innerHTML = `<span class="crumb">Call path · <b>${state.path.length - 1}</b> hops</span><button class="btn small" id="exitPath">Exit path</button>`;
+    $("exitPath").onclick = () => { state.path = null; render(); };
+  } else if (state.view === "focus" && state.selected) {
+    const n = byId.get(state.selected);
+    o.innerHTML = `<span class="crumb">Focus · <b>${esc(label(n))}</b> · ${cy.nodes().length} functions</span>`;
+  } else {
+    const fn = cy.nodes(":childless").length, files = cy.nodes(".file").length;
+    o.innerHTML = `<span class="crumb">Map · <b>${fn}</b> functions in <b>${files}</b> files</span>`;
+  }
+}
+
+// ------------------------------------------------------------------ selection & details
+function select(id, { focus = null, push = true } = {}) {
+  if (!byId.has(id)) return;
+  state.selected = id; state.edgeSel = null;
+  const n = byId.get(id);
+  if (!visible(n)) {           // reveal hidden things the user asked for
+    if (n.test) { state.tests = true; $("optTests").checked = true; }
+    state.hiddenFiles.delete(n.file); syncFileChecks();
+  }
+  if (focus === true) setView("focus", false);
+  if (push) history.replaceState(null, "", "#" + encodeURIComponent(id));
+  showDetail(n);
+  if (state.view === "focus" || !cy.getElementById(id).length) render();
+  else { applyHighlight(); const el = cy.getElementById(id); cy.animate({ center: { eles: el }, zoom: Math.max(cy.zoom(), 0.9) }, { duration: 250 }); }
+}
+
+function codeBlock(n, hlLines = [], strong = []) {
+  const f = DATA.files[n.file];
+  if (!f || !f.src) return "";
+  const lines = f.src.split("\n");
+  const start = n.line, end = Math.min(n.end, lines.length);
+  const cap = 400, stop = Math.min(end, start + cap - 1);
+  const hl = new Set(hlLines), st = new Set(strong);
+  let rows = "";
+  for (let i = start; i <= stop; i++) {
+    const cls = st.has(i) ? "hl2" : hl.has(i) ? "hl" : "";
+    rows += `<tr class="${cls}" data-ln="${i}"><td class="ln">${i}</td><td>${esc(lines[i - 1])}</td></tr>`;
+  }
+  const more = end > stop ? `<div class="empty" style="padding:6px 8px">… ${end - stop} more lines</div>` : "";
+  return `<div class="code" id="codeBox"><table>${rows}</table>${more}</div>`;
+}
+
+function edgeList(edges, dir) {
+  if (!edges.length) return `<div class="empty">none</div>`;
+  const grouped = new Map();
+  for (const e of edges) {
+    const other = dir === "out" ? e.t : e.s;
+    const g = grouped.get(other) || { kinds: new Set(), lines: [] };
+    g.kinds.add(e.k); g.lines.push(...e.lines); grouped.set(other, g);
+  }
+  return [...grouped].sort((a, b) => Math.min(...a[1].lines) - Math.min(...b[1].lines)).map(([other, g]) => {
+    const m = byId.get(other);
+    const kinds = [...g.kinds].map(k => `<span class="kind k-${k}" title="${esc(KINDS[k].desc)}">${k}</span>`).join("");
+    const where = dir === "out" ? `L${[...new Set(g.lines)].join(", L")}` : `${shortFile(m.file).split("/").pop()}:${[...new Set(g.lines)].join(",")}`;
+    return `<div class="list-item" data-go="${esc(other)}" data-lines="${dir === "out" ? g.lines.join(",") : ""}" title="${esc(m.file)}:${m.line}">
+      ${kinds}<span class="n">${esc(label(m))}</span><span class="f">${esc(where)}</span></div>`;
+  }).join("");
+}
+
+function vscodeLink(file, line) { return `vscode://file/${DATA.root}/${file}:${line}`; }
+
+function showDetail(n) {
+  const outs = (outE.get(n.id) || []).filter(edgeOn), ins = (inE.get(n.id) || []).filter(edgeOn);
+  const badges = [
+    `<span class="badge">${n.lang === "py" ? "Python" : "JS/JSX"}</span>`,
+    `<span class="badge">${esc(n.kind)}</span>`,
+    n.async ? `<span class="badge">async</span>` : "",
+    n.route ? `<span class="badge route">${esc(n.route)}</span>` : "",
+    n.entry ? `<span class="badge entry">entry point</span>` : "",
+    n.test ? `<span class="badge">test</span>` : "",
+    !n.test && !n.entry && !ins.length && n.kind !== "module" ? `<span class="badge warn" title="Nothing in the scanned code calls or references this">no callers found</span>` : "",
+    ...(n.decorators || []).map(d => `<span class="badge mono">@${esc(d.length > 40 ? d.slice(0, 40) + "…" : d)}</span>`),
+  ].join("");
+  const callLines = outs.flatMap(e => e.lines);
+  $("detail").innerHTML = `
+    <h2 class="mono">${esc(n.qual)}</h2>
+    <div class="where">${esc(n.file)}:${n.line}–${n.end}</div>
+    <div class="badges">${badges}</div>
+    <div class="sig mono">${esc(n.sig)}</div>
+    ${n.doc ? `<div class="doc">${esc(n.doc)}</div>` : ""}
+    <div class="actions">
+      <a class="btn small" href="${vscodeLink(n.file, n.line)}" title="Open in VS Code">Open in VS Code</a>
+      <button class="btn small" id="copyLoc">Copy file:line</button>
+      ${state.view !== "focus" ? `<button class="btn small" id="toFocus">Focus</button>` : `<button class="btn small" id="toMap">Show on map</button>`}
+      <button class="btn small" id="setA">Path from</button>
+      <button class="btn small" id="setB">Path to</button>
+    </div>
+    <div class="section" style="padding:10px 0"><h3>Called by (${new Set(ins.map(e => e.s)).size})</h3>${edgeList(ins, "in")}</div>
+    <div class="section" style="padding:10px 0"><h3>Calls (${new Set(outs.map(e => e.t)).size})</h3>${edgeList(outs, "out")}</div>
+    ${n.external && n.external.length ? `<div class="section" style="padding:10px 0"><h3>External / unresolved calls (${n.external.length})</h3>
+      <div class="chips">${n.external.slice(0, 60).map(x => `<span class="chip mono">${esc(x)}</span>`).join("")}</div></div>` : ""}
+    <div style="padding-top:10px"><h3 style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 6px">Source <span style="text-transform:none;letter-spacing:0;font-weight:400">· highlighted lines make project calls</span></h3>
+      ${codeBlock(n, callLines)}</div>`;
+  wireDetail(n);
+}
+
+function showEdgeDetail(edgeId) {
+  const [k, s, t] = edgeId.split("|");
+  const e = (outE.get(s) || []).find(x => x.t === t && x.k === k);
+  const src = byId.get(s), dst = byId.get(t);
+  $("detail").innerHTML = `
+    <div class="badges"><span class="kind k-${k}">${k}</span><span class="badge">${esc(KINDS[k].desc)}</span></div>
+    <h2 class="mono"><a href="#" data-go="${esc(s)}" style="color:inherit">${esc(label(src))}</a> → <a href="#" data-go="${esc(t)}" style="color:inherit">${esc(label(dst))}</a></h2>
+    <div class="where">${esc(src.file)} → ${esc(dst.file)}</div>
+    <div class="actions"><a class="btn small" href="${vscodeLink(src.file, e.lines[0])}">Open call site</a>
+      <a class="btn small" href="${vscodeLink(dst.file, dst.line)}">Open target</a></div>
+    <div style="padding-top:8px"><h3 style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 6px">Call site${e.lines.length > 1 ? "s" : ""} in ${esc(label(src))}: L${e.lines.join(", L")}</h3>
+    ${codeBlock(src, [], e.lines)}</div>`;
+  wireDetail(src);
+  const row = document.querySelector(`#codeBox tr[data-ln="${e.lines[0]}"]`);
+  if (row) row.scrollIntoView({ block: "center" });
+}
+
+function wireDetail(n) {
+  const d = $("detail");
+  d.querySelectorAll("[data-go]").forEach(el => {
+    el.onclick = ev => { ev.preventDefault(); select(el.dataset.go); };
+    if (el.dataset.lines) {
+      el.onmouseenter = () => {
+        const ls = el.dataset.lines.split(",").map(Number);
+        d.querySelectorAll("#codeBox tr.hl2").forEach(r => r.classList.remove("hl2"));
+        ls.forEach(l => { const r = d.querySelector(`#codeBox tr[data-ln="${l}"]`); if (r) r.classList.add("hl2"); });
+        const r0 = d.querySelector(`#codeBox tr[data-ln="${ls[0]}"]`); if (r0) r0.scrollIntoView({ block: "nearest" });
+      };
+    }
+  });
+  const on = (id, fn) => { const el = $(id); if (el) el.onclick = fn; };
+  on("copyLoc", () => { navigator.clipboard?.writeText(`${n.file}:${n.line}`).then(() => toast("Copied " + n.file + ":" + n.line), () => toast(`${n.file}:${n.line}`)); });
+  on("toFocus", () => setView("focus"));
+  on("toMap", () => setView("map"));
+  on("setA", () => { state.pathA = n.id; syncPath(); toast("Path start set"); });
+  on("setB", () => { state.pathB = n.id; syncPath(); toast("Path end set"); if (state.pathA) findPath(); });
+}
+
+function emptyDetail() {
+  const total = DATA.nodes.length, files = Object.keys(DATA.files).length;
+  const counts = {}; DATA.edges.forEach(e => counts[e.k] = (counts[e.k] || 0) + 1);
+  $("detail").innerHTML = `
+    <h2>Nothing selected</h2>
+    <p style="color:var(--muted)">Search or click a node to see its callers, callees, unresolved external calls and source. Double-click a node to focus on its call chain.</p>
+    <div class="section" style="padding:10px 0"><h3>Scanned</h3>
+      <div>${total} functions · ${files} files · ${DATA.edges.length} edges</div>
+      <div class="chips" style="margin-top:6px">${Object.entries(counts).map(([k, v]) => `<span class="kind k-${k}">${k} ${v}</span>`).join(" ")}</div>
+      <div style="color:var(--faint);font-size:12px;margin-top:6px">Generated ${esc(DATA.generated)} · re-run <span class="mono">python tools/callgraph/build_callgraph.py</span> after code changes.</div>
+      ${DATA.parseErrors.length ? `<div class="badge warn" style="margin-top:6px">Skipped ${DATA.parseErrors.length} file(s) with syntax errors: ${esc(DATA.parseErrors.join("; "))}</div>` : ""}
+    </div>
+    <div class="section" style="padding:10px 0"><h3>Shapes</h3>
+      <div>● function / method &nbsp; ◆ entry point (route, main, tool) &nbsp; ▬ module-level code</div></div>
+    <div class="section" style="padding:10px 0;border:0"><h3>Accuracy notes</h3>
+      <div style="color:var(--muted)">Static analysis: calls through dynamic dispatch, <span class="mono">getattr</span>, dict lookups or untyped variables may be missing. Orange “inferred” edges are best guesses from unique method names; purple “dispatch” edges show which subclass overrides <span class="mono">self.m()</span> could reach.</div></div>`;
+}
+
+// ------------------------------------------------------------------ path finder
+function syncPath() {
+  const a = $("pathA"), b = $("pathB");
+  a.textContent = state.pathA ? "from: " + label(byId.get(state.pathA)) : "from: pick a node"; a.classList.toggle("set", !!state.pathA);
+  b.textContent = state.pathB ? "to: " + label(byId.get(state.pathB)) : "to: pick a node"; b.classList.toggle("set", !!state.pathB);
+}
+function findPath() {
+  if (!state.pathA || !state.pathB) return toast("Pick both ends first");
+  const prev = new Map([[state.pathA, null]]); const q = [state.pathA];
+  while (q.length) {
+    const v = q.shift(); if (v === state.pathB) break;
+    for (const e of (outE.get(v) || [])) if (edgeOn(e) && !prev.has(e.t)) { prev.set(e.t, v); q.push(e.t); }
+  }
+  if (!prev.has(state.pathB)) return toast("No call path found with the enabled edge types");
+  const path = []; for (let v = state.pathB; v; v = prev.get(v)) path.unshift(v);
+  state.path = path; state.selected = state.pathB; showDetail(byId.get(state.pathB)); render();
+}
+$("pathGo").onclick = findPath;
+$("pathClear").onclick = () => { state.pathA = state.pathB = null; syncPath(); if (state.path) { state.path = null; render(); } };
+
+// ------------------------------------------------------------------ sidebar: filters & file tree
+function buildFilters() {
+  $("cntTests").textContent = DATA.nodes.filter(n => n.test).length;
+  $("edgeKinds").innerHTML = Object.entries(KINDS).map(([k, v]) => {
+    const n = DATA.edges.filter(e => e.k === k).length;
+    const style = { call: "solid", dispatch: "dashed", inferred: "dotted", ref: "dashed", http: "solid" }[k];
+    return `<label class="row" title="${esc(v.desc)}"><input type="checkbox" data-kind="${k}" ${state.kinds[k] ? "checked" : ""}>
+      <span class="legend-line" style="border-top-style:${style};border-color:var(--e-${k});${k === "http" ? "border-top-width:3px" : ""}"></span>${v.label}
+      <span style="color:var(--faint);font-size:11px">${esc(v.desc)}</span><span class="count">${n}</span></label>`;
+  }).join("");
+  $("edgeKinds").querySelectorAll("input").forEach(i => i.onchange = () => { state.kinds[i.dataset.kind] = i.checked; rerender(); });
+
+  const byArea = new Map();
+  for (const [f, info] of Object.entries(DATA.files)) {
+    const list = byArea.get(info.area) || []; list.push(f); byArea.set(info.area, list);
+  }
+  const fnCount = f => DATA.nodes.filter(n => n.file === f).length;
+  $("fileTree").innerHTML = AREAS.filter(a => byArea.has(a)).map(a => {
+    const files = byArea.get(a).sort();
+    return `<div class="area ${a === "tests" ? "collapsed" : ""}" data-area="${esc(a)}">
+      <div class="head"><span class="caret">▾</span><input type="checkbox" class="areaChk" data-area="${esc(a)}" checked>
+        <span class="swatch" data-sw="${esc(a)}"></span>${esc(a)}<span class="count" style="margin-left:auto;color:var(--faint);font-weight:400;font-size:11px">${files.reduce((s, f) => s + fnCount(f), 0)}</span></div>
+      <div class="files">${files.map(f => `<label class="row" title="${esc(f)}"><input type="checkbox" class="fileChk" data-file="${esc(f)}" checked>
+        <span class="name">${esc(f.split("/").pop())}</span><span class="count">${fnCount(f)}</span></label>`).join("")}</div></div>`;
+  }).join("");
+  paintSwatches();
+  $("fileTree").querySelectorAll(".area > .head").forEach(h => h.onclick = ev => {
+    if (ev.target.tagName === "INPUT") return; h.parentElement.classList.toggle("collapsed");
+  });
+  $("fileTree").querySelectorAll(".areaChk").forEach(c => c.onchange = () => {
+    const files = Object.entries(DATA.files).filter(([, i]) => i.area === c.dataset.area).map(([f]) => f);
+    files.forEach(f => c.checked ? state.hiddenFiles.delete(f) : state.hiddenFiles.add(f));
+    if (c.dataset.area === "tests" && c.checked) { state.tests = true; $("optTests").checked = true; }
+    syncFileChecks(); rerender();
+  });
+  $("fileTree").querySelectorAll(".fileChk").forEach(c => c.onchange = () => {
+    c.checked ? state.hiddenFiles.delete(c.dataset.file) : state.hiddenFiles.add(c.dataset.file);
+    if (c.checked && DATA.files[c.dataset.file].area === "tests") { state.tests = true; $("optTests").checked = true; }
+    syncFileChecks(); rerender();
+  });
+}
+function paintSwatches() { document.querySelectorAll("[data-sw]").forEach(s => s.style.background = areaColor(s.dataset.sw)); }
+function syncFileChecks() {
+  document.querySelectorAll(".fileChk").forEach(c => c.checked = !state.hiddenFiles.has(c.dataset.file));
+  document.querySelectorAll(".areaChk").forEach(c => {
+    const files = Object.entries(DATA.files).filter(([, i]) => i.area === c.dataset.area).map(([f]) => f);
+    const hidden = files.filter(f => state.hiddenFiles.has(f)).length;
+    c.checked = hidden < files.length; c.indeterminate = hidden > 0 && hidden < files.length;
+  });
+}
+$("allFiles").onclick = e => { e.preventDefault(); state.hiddenFiles.clear(); syncFileChecks(); rerender(); };
+$("noFiles").onclick = e => { e.preventDefault(); Object.keys(DATA.files).forEach(f => state.hiddenFiles.add(f)); syncFileChecks(); rerender(); };
+$("optTests").onchange = e => { state.tests = e.target.checked; rerender(); };
+$("optModule").onchange = e => { state.module = e.target.checked; rerender(); };
+$("optIsolated").onchange = e => { state.isolated = e.target.checked; rerender(); };
+for (const [id, key] of [["depthUp", "up"], ["depthDown", "down"]]) {
+  $(id).oninput = e => { state[key] = +e.target.value; $(id + "V").textContent = e.target.value; if (state.view === "focus") rerender(); };
+}
+let rerenderTimer;
+function rerender() { clearTimeout(rerenderTimer); rerenderTimer = setTimeout(() => { if (state.selected) showDetail(byId.get(state.selected)); render(); }, 120); }
+
+function buildInsights() {
+  const item = (n, extra = "") => `<div class="list-item" data-go="${esc(n.id)}" title="${esc(n.file)}:${n.line}">
+    <span class="swatch" style="background:${areaColor(n.area)}"></span><span class="n">${esc(label(n))}</span><span class="f">${extra || esc(n.file.split("/").pop())}</span></div>`;
+  const sec = (title, help, body, open = true) => `<details class="section" ${open ? "open" : ""}><summary style="cursor:pointer"><h3 style="display:inline">${title}</h3></summary>
+    <div style="color:var(--faint);font-size:12px;margin:4px 0 6px">${help}</div>${body || `<div class="empty">none</div>`}</details>`;
+  const I = insights;
+  $("insights").innerHTML =
+    sec(`Entry points (${I.entries.length})`, "API routes, CLI mains and decorated tools — where execution starts.", I.entries.map(n => item(n, n.route ? esc(n.route) : "")).join("")) +
+    sec(`UI → API calls (${I.http.length})`, "Frontend fetch() calls matched to the FastAPI handler.", I.http.map(e => `<div class="list-item" data-go="${esc(e.t)}"><span class="kind k-http">http</span><span class="n">${esc(label(byId.get(e.s)))} → ${esc(label(byId.get(e.t)))}</span></div>`).join("")) +
+    sec(`Hotspots (most callers)`, "Many functions depend on these — a bug here spreads widely.", I.fanIn.map(([n, c]) => item(n, `${c} callers`)).join("")) +
+    sec(`Biggest fan-out`, "Functions that orchestrate many others — good breakpoints.", I.fanOut.map(([n, c]) => item(n, `calls ${c}`)).join(""), false) +
+    sec(`Recursion & cycles (${I.sccs.length})`, "Functions that can call back into themselves.", I.sccs.map(c => `<div style="margin-bottom:6px">${c.map(id => item(byId.get(id))).join("")}</div>`).join(""), false) +
+    sec(`No callers found (${I.dead.length})`, "Possibly dead code — or called dynamically (getattr, registries, abstract interfaces).", I.dead.map(n => item(n)).join(""), false);
+  $("insights").querySelectorAll("[data-go]").forEach(el => el.onclick = () => select(el.dataset.go));
+}
+
+// ------------------------------------------------------------------ search
+const searchIndex = DATA.nodes.map(n => ({ n, hay: (n.qual + " " + n.file + " " + (n.route || "")).toLowerCase() }));
+let searchHits = [], activeHit = 0;
+function doSearch() {
+  const q = $("q").value.trim().toLowerCase();
+  const box = $("results");
+  if (!q) { box.classList.remove("open"); return; }
+  const terms = q.split(/\s+/);
+  searchHits = searchIndex.filter(x => terms.every(t => x.hay.includes(t)))
+    .map(x => ({ n: x.n, score: (x.n.name.toLowerCase() === q ? 0 : x.n.name.toLowerCase().startsWith(q) ? 1 : x.n.qual.toLowerCase().includes(q) ? 2 : 3) + (x.n.test ? 0.5 : 0) }))
+    .sort((a, b) => a.score - b.score || a.n.qual.length - b.n.qual.length).slice(0, 40).map(x => x.n);
+  activeHit = 0;
+  box.innerHTML = searchHits.length ? searchHits.map((n, i) => `<div data-i="${i}" class="${i === 0 ? "active" : ""}">
+    <span class="swatch" style="background:${areaColor(n.area)}"></span><span class="mono">${esc(n.qual)}</span><span class="f">${esc(n.file)}:${n.line}</span></div>`).join("")
+    : `<div class="empty">No matches</div>`;
+  box.classList.add("open");
+  box.querySelectorAll("[data-i]").forEach(el => el.onmousedown = ev => { ev.preventDefault(); pickHit(+el.dataset.i); });
+}
+function pickHit(i) { const n = searchHits[i]; if (!n) return; $("results").classList.remove("open"); $("q").blur(); select(n.id); }
+$("q").oninput = doSearch;
+$("q").onfocus = doSearch;
+$("q").onblur = () => setTimeout(() => $("results").classList.remove("open"), 100);
+$("q").onkeydown = e => {
+  const rows = $("results").querySelectorAll("[data-i]");
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault(); activeHit = Math.max(0, Math.min(rows.length - 1, activeHit + (e.key === "ArrowDown" ? 1 : -1)));
+    rows.forEach((r, i) => r.classList.toggle("active", i === activeHit)); rows[activeHit]?.scrollIntoView({ block: "nearest" });
+  } else if (e.key === "Enter") pickHit(activeHit);
+  else if (e.key === "Escape") { $("q").blur(); }
+};
+
+// ------------------------------------------------------------------ wiring
+function setView(v, doRender = true) {
+  if (v === "focus" && !state.selected) { toast("Select a function first"); return; }
+  state.view = v; state.path = null;
+  document.querySelectorAll("#viewSeg button").forEach(b => b.classList.toggle("on", b.dataset.view === v));
+  if (state.selected) showDetail(byId.get(state.selected));
+  if (doRender) render();
+}
+document.querySelectorAll("#viewSeg button").forEach(b => b.onclick = () => setView(b.dataset.view));
+document.querySelectorAll("#leftTabs button").forEach(b => b.onclick = () => {
+  document.querySelectorAll("#leftTabs button").forEach(x => x.classList.toggle("on", x === b));
+  $("tab-filters").hidden = b.dataset.tab !== "filters"; $("tab-insights").hidden = b.dataset.tab !== "insights";
+});
+
+cy.on("tap", "node", ev => {
+  const n = ev.target; if (n.hasClass("file")) return;
+  if (state.view === "focus" && !state.path) select(n.id(), { focus: true });
+  else select(n.id());
+});
+cy.on("dbltap", "node", ev => { if (!ev.target.hasClass("file")) select(ev.target.id(), { focus: true }); });
+cy.on("tap", "edge", ev => { state.edgeSel = ev.target.id(); applyHighlight(); showEdgeDetail(ev.target.id()); });
+cy.on("tap", ev => { if (ev.target === cy) clearSelection(); });
+cy.on("mouseover", "node", ev => { if (!ev.target.hasClass("file")) $("cy").style.cursor = "pointer"; });
+cy.on("mouseout", "node", () => $("cy").style.cursor = "");
+
+function clearSelection() {
+  state.edgeSel = null;
+  if (state.view === "focus" || state.path) { applyHighlight(); return; }
+  state.selected = null; history.replaceState(null, "", location.pathname + location.search); applyHighlight(); emptyDetail();
+}
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT") return;
+  if (e.key === "/") { e.preventDefault(); $("q").focus(); }
+  else if (e.key === "Escape") { if (state.path) { state.path = null; render(); } else if (state.view === "focus") setView("map"); else clearSelection(); }
+  else if (e.key === "f" && state.selected) setView("focus");
+  else if (e.key === "m") setView("map");
+});
+$("zIn").onclick = () => cy.zoom({ level: cy.zoom() * 1.3, renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 } });
+$("zOut").onclick = () => cy.zoom({ level: cy.zoom() / 1.3, renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 } });
+$("zFit").onclick = () => cy.fit(undefined, 40);
+$("themeBtn").onclick = () => {
+  document.documentElement.dataset.theme = theme() === "dark" ? "light" : "dark";
+  try { localStorage.setItem("cg-theme", document.documentElement.dataset.theme); } catch (_) {}
+  retheme();
+};
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", retheme);
+function retheme() {
+  cy.style(cyStyle());
+  cy.nodes(":childless").forEach(n => { const d = byId.get(n.id()); if (d) n.data("color", areaColor(d.area)); });
+  paintSwatches(); buildInsights();
+}
+
+// ------------------------------------------------------------------ boot
+try { const t = localStorage.getItem("cg-theme"); if (t) document.documentElement.dataset.theme = t; } catch (_) {}
+$("meta").textContent = `${DATA.nodes.length} functions · ${Object.keys(DATA.files).length} files · generated ${DATA.generated}`;
+cy.style(cyStyle());
+buildFilters(); buildInsights(); syncPath();
+const initial = decodeURIComponent(location.hash.slice(1));
+if (initial && byId.has(initial)) { select(initial, { push: false }); }
+else { emptyDetail(); render(); }
+</script>
+</body>
+</html>

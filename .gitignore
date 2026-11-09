@@ -71,3 +71,11 @@ aegis-cve-evidence/Internet_lookup/QUERY_RESEARCH.md
 tools/function_sequence/
 # Central baseline host context (real server build; optional fallback, AEGIS_CENTRAL_CONTEXT)
 aegis-cve-evidence/context_gathered/inventory/central/
+# Per-CVE dummy context JSONs (only for run_grouped_remediation --context-dir --allow-dummy)
+aegis-cve-evidence/context_gathered/test/
+aegis-cve-evidence/context_gathered/product_context.json
+# Real server inventory collected from scarck-vprk012 (read by the app; kept local only)
+aegis-cve-evidence/context_gathered/inventory/sterling_rocky8.yaml
+# Personal batch script (hardcoded CVEs) and the empty root lock file
+aegis-cve-evidence/run_all_cves.ps1
+/package-lock.json

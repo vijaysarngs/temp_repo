@@ -28,6 +28,12 @@ aegis-cve-evidence/results/
 aegis-cve-evidence/context_gathered/Gathered_context/
 aegis-cve-evidence/context_gathered/inventory/raw/
 aegis-cve-evidence/context_gathered/inventory/disabled/
+# Real server context uploaded through the self-service script
+aegis-cve-evidence/context_gathered/inventory/uploaded/
+# Delivery agent output (committed to the delivery repository instead, AEGIS_DELIVERY_REPO)
+aegis-cve-evidence/delivery/artifacts/
+# Answers to compatibility questions (facts about real servers)
+aegis-cve-evidence/compatibility/answers.json
 data/selected_components_ui-*.csv
 data/ui-*.csv
 tools/callgraph/callgraph.html
@@ -38,3 +44,30 @@ tools/callgraph/callgraph.html
 .idea/
 .DS_Store
 Thumbs.db
+
+# Stand-alone CVE feed enrichment: cached responses and outputs
+cve_feed_enrichment/cache/
+cve_feed_enrichment/output/
+
+# Local sign-in database (users, sessions, runs) when AEGIS_AUTH_DB=sqlite
+.aegis/
+# Context script agent request log and generated scripts (server names, components)
+aegis-cve-evidence/context_gathered/script_agent_runs/
+
+# Working data and outputs (kept on disk, never committed): CVE exports, enriched and
+# selected-component CSVs, compatibility scope tables, proofs, collector sample outputs.
+data/*
+!data/.gitkeep
+compatibility_scope/
+proofs/
+docs/
+aegis-cve-evidence/context_gathered/script_review/
+**/sample_output_*.txt
+/classification_diagnostics.json
+/deduplicated_cves.csv
+*.log
+aegis-cve-evidence/testing_evidence_*/
+aegis-cve-evidence/Internet_lookup/QUERY_RESEARCH.md
+tools/function_sequence/
+# Central baseline host context (real server build; optional fallback, AEGIS_CENTRAL_CONTEXT)
+aegis-cve-evidence/context_gathered/inventory/central/

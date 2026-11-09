@@ -20,3 +20,9 @@ export function combineRemediationRuns(runs) {
     results,
   };
 }
+
+// The DOM id of a result card (results and previous-fixes pages); other pages link to `#<id>`.
+export function resultAnchor(result) {
+  return "result-" + [result.run_id, result.cve, result.component_id, result.host]
+    .map((part) => String(part || "")).join("-").replace(/[^A-Za-z0-9_-]+/g, "_");
+}

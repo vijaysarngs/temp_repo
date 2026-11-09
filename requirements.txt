@@ -22,6 +22,9 @@ lxml>=5,<7
 # Inventory and file integrations
 openpyxl>=3.1
 oracledb>=2.0
+PyYAML>=6.0
+# Keeps knowledge.yaml's comments when the UI saves a compatibility rule into it.
+ruamel.yaml>=0.18,<0.19
 paramiko>=5.0,<6.0
 
 # Test runner

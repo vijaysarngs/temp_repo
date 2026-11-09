@@ -2,6 +2,8 @@
 // Rows keep their original index so selection and row numbers stay correct.
 
 export const DISTINCT_LIMIT = 30;
+// A column header lists up to this many values to tick; beyond it the filter is free text.
+export const COLUMN_VALUE_LIMIT = 300;
 
 function text(value) {
   return String(value ?? "").trim();
@@ -19,11 +21,13 @@ export function distinctValues(rows, column, limit = DISTINCT_LIMIT) {
   return [...values].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 }
 
-// filter: { column, value, mode: "contains" | "equals" | "empty" | "not_empty" }
+// filter: { column, mode: "in" (values: ticked values, "" = empty) | "contains" | "equals"
+// | "empty" | "not_empty", value }
 export function matchesFilter(row, filter) {
   const cell = text(row[filter.column]);
   const wanted = text(filter.value).toLowerCase();
   switch (filter.mode) {
+    case "in": return (filter.values || []).some((value) => text(value).toLowerCase() === cell.toLowerCase());
     case "equals": return cell.toLowerCase() === wanted;
     case "empty": return !cell;
     case "not_empty": return Boolean(cell);
@@ -42,7 +46,8 @@ export function matchesSearch(row, columns, query) {
 // Returns [{ row, index }] for rows that pass the search, every column filter and the extra test.
 export function filterRows(rows, columns, { query = "", filters = [], extra = null } = {}) {
   const active = filters.filter((filter) => filter.column &&
-    (filter.mode === "empty" || filter.mode === "not_empty" || text(filter.value)));
+    (filter.mode === "empty" || filter.mode === "not_empty" || text(filter.value)
+     || (filter.mode === "in" && filter.values?.length)));
   const entries = [];
   rows.forEach((row, index) => {
     if (!matchesSearch(row, columns, query)) return;

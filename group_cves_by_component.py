@@ -10,7 +10,9 @@ LIST_COLUMNS = {
     "Application", "Description", "CVE IDs", "Operating System",
     "Technical Details", "Evidence", "Affected Symbol", "Source Path",
     "Component Kind", "Classification Status", "Classification Reason",
-    "Source Rows",
+    "Source Rows", "Hostname", "Hosts",
+    "NVD Description", "CVSS", "CWE", "Affected Versions (NVD)", "Fixed Versions (NVD)",
+    "Known Exploited",
 }
 
 
@@ -18,18 +20,33 @@ def _values(value):
     return [item.strip() for item in str(value or "").split(" | ") if item.strip()]
 
 
+# Labels that mean "no component was identified"; such CVEs are never combined.
+UNSPECIFIED_COMPONENTS = {"", "unspecified", "unspecified component"}
+
+
+def is_unspecified_component(component):
+    return str(component or "").strip().casefold() in UNSPECIFIED_COMPONENTS
+
+
 def group_by_product_and_component(rows):
-    """Combine CVEs only when both their product and component match."""
+    """Combine CVEs only when both their product and component match.
+
+    A CVE with no identified component stays on its own row (its contexts are still
+    merged) with its own Component ID, so remediation treats each one separately.
+    """
     groups = {}
     for row in rows:
         product = str(row.get("Product", "")).strip()
         component = str(row.get("Component", "")).strip()
-        key = (product, component)
+        identity = component
+        if is_unspecified_component(component):
+            identity = f"{component} [{' | '.join(_values(row.get('CVE IDs', '')))}]"
+        key = (product, identity)
         group = groups.setdefault(key, {
             column: [] if column in LIST_COLUMNS else str(row.get(column, "")).strip()
             for column in COMPONENT_COLUMNS
         })
-        group["Component ID"] = component_identifier(product, component)
+        group["Component ID"] = component_identifier(product, identity)
         for column in LIST_COLUMNS:
             group[column].extend(_values(row.get(column, "")))
 
@@ -40,7 +57,7 @@ def group_by_product_and_component(rows):
             for column, value in group.items()
         })
     return sorted(output, key=lambda row: (
-        row["Product"].casefold(), row["Component"].casefold()
+        row["Product"].casefold(), row["Component"].casefold(), row["CVE IDs"]
     ))
 
 

@@ -202,8 +202,8 @@ function ArtifactPanel({ artifact, config, onPushed }) {
       <div className="delivery-artifact-head">
         <div>
           <span className="eyebrow"><FileDiff size={13} /> Artifact ready</span>
-          <strong>{artifact.artifact_id}</strong>
-          <small>{serverName(artifact.server)} · strategy {artifact.strategy} · {new Date(artifact.created_at).toLocaleString()}</small>
+          <strong>{serverName(artifact.server)}</strong>
+          <small>Strategy {artifact.strategy} · {new Date(artifact.created_at).toLocaleString()}</small>
         </div>
         <div className="delivery-artifact-actions">
           <a className="button button-secondary button-small" href={`/api/delivery/artifacts/${artifact.artifact_id}/download`}>
@@ -481,7 +481,7 @@ export default function DeliveryView({ runIds, items, scopeLabel, onBack, onMidd
                         {serverHistory.slice(0, 8).map((entry) => (
                           <li key={entry.artifact_id}>
                             <div>
-                              <code>{entry.artifact_id}</code>
+                              <strong>{new Date(entry.created_at).toLocaleString()}</strong>
                               <small>{entry.strategy} · {entry.summary?.products} products{entry.git
                                 ? ` · ${entry.git.pushed ? "pushed" : "committed"} ${entry.git.branch}` : ""}</small>
                             </div>

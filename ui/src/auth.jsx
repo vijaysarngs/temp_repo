@@ -242,9 +242,9 @@ function AdminUsers({ me, onClose }) {
         </form>
         {!!runs.length && (
           <details className="admin-runs"><summary>Recent runs ({runs.length})</summary>
-            <table className="admin-table"><thead><tr><th>Run</th><th>File</th><th>Started by</th><th>Status</th><th>Started</th></tr></thead>
+            <table className="admin-table"><thead><tr><th>File</th><th>Started by</th><th>Status</th><th>Started</th></tr></thead>
               <tbody>{runs.slice(0, 30).map((run) => (
-                <tr key={run.run_id}><td><code>{run.run_id}</code></td><td>{run.source_file_name || "—"}</td>
+                <tr key={run.run_id}><td>{run.source_file_name || "—"}</td>
                   <td>{run.initiated_by || "—"}</td><td>{run.status}</td>
                   <td>{run.started_at ? new Date(run.started_at).toLocaleString() : "—"}</td></tr>))}</tbody></table>
           </details>

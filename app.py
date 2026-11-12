@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock, Thread
@@ -21,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from agent_utils import create_llm_client
 from aegis_auth import service as auth_service
 from aegis_auth.web import current_session_id, enabled as auth_enabled, install as install_auth
+from product_names import canonical_product
 from cve_component_enrichment import (
     add_nvd_descriptions,
     apply_nvd_fallback,
@@ -34,6 +36,7 @@ from cve_component_enrichment import (
     write_csv,
 )
 from app_state import StateDict, mark_interrupted
+import data_store
 from group_cves_by_component import group_by_product_and_component, write_grouped_csv
 
 
@@ -89,6 +92,18 @@ def close_interrupted_runs():
         print(f"could not close interrupted runs: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
+@app.on_event("startup")
+def sync_compatibility_rules():
+    """knowledge.yaml (from git) -> the Oracle rules table CVE_COMPAT_RULES, so both agree."""
+    try:
+        from compatibility import rules_db
+
+        print(f"compatibility rules synced to {rules_db.TABLE}: {rules_db.sync(changed_by='startup sync')}",
+              file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - reported; compatibility checks fail until Oracle is reachable
+        print(f"compatibility rules sync failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+
 def record_run_event(action, *args, **kwargs):
     """Record a run in aegis_runs (who started it, status); never blocks the pipeline."""
     if not auth_enabled():
@@ -120,6 +135,19 @@ def csv_response(rows, columns, filename):
     )
 
 
+def normalize_enriched_row(row):
+    """One enrichment row with every column, its product spelling and its Component ID."""
+    normalized = {column: str(row.get(column, "") or "") for column in COMPONENT_COLUMNS}
+    normalized["Product"] = canonical_product(normalized["Product"])
+    normalized["Component ID"] = component_identifier(normalized["Product"], normalized["Component"])
+    return normalized
+
+
+def db_problem(action, exc):
+    """A database problem in data_store: reported, and the caller falls back to the files."""
+    print(f"data_store {action} failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+
 def read_enriched_csv(path):
     """Read an enrichment output while enforcing the grouping input contract."""
     with Path(path).open(encoding="utf-8-sig", newline="") as handle:
@@ -131,14 +159,7 @@ def read_enriched_csv(path):
         missing = [column for column in required_columns if column not in (reader.fieldnames or [])]
         if missing:
             raise ValueError("CSV is not a component enrichment file; missing " + ", ".join(missing))
-        rows = []
-        for row in reader:
-            normalized = {
-                column: str(row.get(column, "") or "") for column in COMPONENT_COLUMNS
-            }
-            normalized["Component ID"] = component_identifier(
-                normalized["Product"], normalized["Component"])
-            rows.append(normalized)
+        rows = [normalize_enriched_row(row) for row in reader]
     if not rows:
         raise ValueError("The saved enrichment CSV has no records.")
     return rows
@@ -154,6 +175,12 @@ def request_user(request) -> dict:
     """The signed-in user; with sign-in disabled (AEGIS_AUTH=off) the local administrator."""
     user = getattr(getattr(request, "state", None), "user", None)
     return user or {"user_id": "local", "user_role": "ADMIN"}
+
+
+def rule_author(request) -> str:
+    """Who saved a compatibility rule, for the rules history table."""
+    user = request_user(request)
+    return str(user.get("email") or user.get("display_name") or user.get("user_id") or "unknown")
 
 
 def is_admin(user) -> bool:
@@ -175,26 +202,75 @@ def may_access(request, owner_id) -> bool:
     return is_admin(user) or (bool(owner_id) and owner_id == user.get("user_id"))
 
 
+_ENRICHMENT_COUNTS: dict[str, tuple[tuple[int, int], int]] = {}
+
+
+def enrichment_row_count(path) -> int:
+    """Records in a saved enrichment (0 when it is not one), without reading it into rows.
+
+    The upload page lists every saved enrichment; parsing each one in full (a 160 MB export
+    is 66,000 rows) made every page load take seconds. Same test as read_enriched_csv
+    (required columns, at least one record), and cached until the file changes."""
+    path = Path(path)
+    try:
+        stat = path.stat()
+    except OSError:
+        return 0
+    stamp = (stat.st_mtime_ns, stat.st_size)
+    cached = _ENRICHMENT_COUNTS.get(str(path))
+    if cached and cached[0] == stamp:
+        return cached[1]
+    count = 0
+    try:
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            reader = csv.reader(handle)
+            header = next(reader, None) or []
+            required = [c for c in COMPONENT_COLUMNS if c not in OPTIONAL_COMPONENT_COLUMNS]
+            if all(column in header for column in required):
+                count = sum(1 for row in reader if row)   # DictReader skips blank lines too
+    except (OSError, UnicodeDecodeError, csv.Error):
+        count = 0
+    _ENRICHMENT_COUNTS[str(path)] = (stamp, count)
+    return count
+
+
 def reusable_enrichment_files(request=None):
-    """Return valid saved enrichment outputs, newest first (a non-admin: only their own)."""
-    if not DATA_DIR.exists():
-        return []
+    """Return valid saved enrichments, newest first (a non-admin: only their own).
+
+    Saved enrichments live in the database (CVE_ENRICHMENT); enrichment CSVs still in data/
+    from before are listed too, unless the database has one of the same name."""
     user = request_user(request)
     candidates = []
+    saved_names = set()
+    try:
+        for entry in data_store.list_enrichments():
+            saved_names.add(entry["display_name"])
+            owner = entry.get("owner_id") or job_owner(entry.get("upload_id"))
+            if not is_admin(user) and (not owner or owner != user.get("user_id")):
+                continue
+            modified = entry.get("updated_at") or datetime.now(timezone.utc)
+            candidates.append({"filename": entry["display_name"], "row_count": int(entry["row_count"] or 0),
+                               "modified_at": modified.isoformat(), "_mtime": modified.timestamp()})
+    except Exception as exc:  # noqa: BLE001 - the files below are still offered
+        db_problem("listing enrichments", exc)
+    if not DATA_DIR.exists():
+        candidates.sort(key=lambda item: item["_mtime"], reverse=True)
+        return [{k: v for k, v in item.items() if k != "_mtime"} for item in candidates]
     for path in DATA_DIR.glob("*.csv"):
+        if path.name in saved_names:
+            continue
         if path.name == "grouped_by_comp.csv" or path.name.startswith("selected_components_"):
             continue
         # A saved enrichment is named after its upload: the upload's owner may reuse it.
         if not is_admin(user) and job_owner(path.stem) != user.get("user_id"):
             continue
-        try:
-            rows = read_enriched_csv(path)
-        except (OSError, ValueError, csv.Error):
+        row_count = enrichment_row_count(path)
+        if not row_count:
             continue
         modified = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
         candidates.append({
             "filename": path.name,
-            "row_count": len(rows),
+            "row_count": row_count,
             "modified_at": modified.isoformat(),
             "_mtime": path.stat().st_mtime,
         })
@@ -207,21 +283,19 @@ def reusable_enrichment_files(request=None):
 def grouped_payload(job_id, enriched_rows, source, source_filename):
     grouped_rows = group_by_product_and_component(enriched_rows)
     job = JOBS[job_id]
-    job["enriched_rows"] = enriched_rows
-    job["grouped_rows"] = grouped_rows
-    grouped_filename = "grouped_by_comp.csv"
+    # One write of the job record (each write reads and rewrites the whole record).
+    job.update({"enriched_rows": enriched_rows, "grouped_rows": grouped_rows})
+    grouped_filename = "grouped components (database)"
     warning = None
     try:
-        write_grouped_csv(DATA_DIR / grouped_filename, enriched_rows)
-    except PermissionError:
-        # Excel commonly locks an open CSV on Windows. Preserve the run instead
-        # of failing after enrichment has already completed successfully.
+        enrichment_id = data_store.enrichment_id_for(source_filename)
+        data_store.save_grouped(job_id, grouped_rows, enrichment_id)
+    except Exception as exc:  # noqa: BLE001 - keep the grouping in a file instead
+        db_problem("saving grouped rows", exc)
         grouped_filename = f"grouped_by_comp_{job_id}.csv"
         write_grouped_csv(DATA_DIR / grouped_filename, enriched_rows)
-        warning = (
-            "data/grouped_by_comp.csv is open or locked, so this run was saved as "
-            f"data/{grouped_filename}. Close the locked file before the next run."
-        )
+        warning = (f"The database could not save the grouped components, so they were saved as "
+                   f"data/{grouped_filename}.")
     job["grouped_filename"] = grouped_filename
     return {
         "run_id": job_id,
@@ -238,7 +312,55 @@ def grouped_payload(job_id, enriched_rows, source, source_filename):
     }
 
 
-def execute_selected_pipeline(run_id, selected_path):
+def archive_run(run_id):
+    """Save a finished run's JSON (combined result, summary, progress) in CVE_RUN_ARTIFACT."""
+    try:
+        data_store.archive_run_folder(REMEDIATION_RUNS_DIR, run_id)
+    except Exception as exc:  # noqa: BLE001 - the run folder is still read when this fails
+        db_problem(f"saving run {run_id}", exc)
+
+
+def run_json(run_id, kind, path, stamp=None):
+    """A run's saved JSON: from the database, else from its file in the run folder (runs from
+    before the database held them), else None."""
+    try:
+        value = data_store.get_artifact(run_id, kind, stamp)
+    except Exception as exc:  # noqa: BLE001 - the file is read instead
+        db_problem(f"reading {kind} of {run_id}", exc)
+        value = None
+    if value is not None:
+        return value
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+
+
+def save_run_json(run_id, kind, value, path):
+    """Save a run's JSON in the database; in its run-folder file when the database fails."""
+    try:
+        data_store.put_artifact(run_id, kind, value)
+        return
+    except Exception as exc:  # noqa: BLE001 - kept in the file instead
+        db_problem(f"saving {kind} of {run_id}", exc)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pending = path.with_name(path.name + ".tmp")
+    pending.write_text(json.dumps(value, ensure_ascii=False, default=str), encoding="utf-8")
+    pending.replace(path)
+
+
+def execute_selected_pipeline(run_id, selected_path, applications=None):
+    try:
+        _execute_selected_pipeline(run_id, selected_path, applications)
+    finally:
+        archive_run(run_id)
+        # The selection is kept in CVE_RUN_SELECTION; its CSV was only the runner's input.
+        if Path(selected_path).parent != DATA_DIR:
+            Path(selected_path).unlink(missing_ok=True)
+
+
+def _execute_selected_pipeline(run_id, selected_path, applications=None):
     run = PIPELINE_RUNS[run_id]
     run["status"] = "running"
     run["started_at"] = datetime.now(timezone.utc).isoformat()
@@ -254,6 +376,8 @@ def execute_selected_pipeline(run_id, selected_path):
             # One assessment per selected product (its newest CVE, on one server), not one
             # per component and server: 4 selected rows had made 324 runs.
             latest_per_product=True,
+            # The middleware systems chosen before the run: one assessment each, one evidence fetch.
+            applications=applications or None,
             continue_on_error=True,
             run_id=run_id,
             upload_id=run.get("job_id"),
@@ -300,12 +424,10 @@ def saved_pipeline_run(run_id):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run_id):
         return None
     combined = REMEDIATION_RUNS_DIR / f"grouped_remediation_{run_id}.json"
-    if not combined.is_file():
+    aggregate = run_json(run_id, "AGGREGATE", combined)
+    if not isinstance(aggregate, dict):
         return None
-    try:
-        aggregate = json.loads(combined.read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
-        return None
+    in_database = not combined.is_file()
     raw_status = str(aggregate.get("status", ""))
     if raw_status in ("completed", "completed_with_errors"):
         status = "completed"
@@ -315,10 +437,7 @@ def saved_pipeline_run(run_id):
         status = "running"
     summary = REMEDIATION_RUNS_DIR / run_id / "run_summary.json"
     progress_path = REMEDIATION_RUNS_DIR / run_id / "workflow_progress.json"
-    try:
-        workflow_progress = json.loads(progress_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        workflow_progress = None
+    workflow_progress = run_json(run_id, "PROGRESS", progress_path)
     selected = aggregate.get("selection", {}).get("selected_cves")
     return {
         "run_id": run_id,
@@ -328,7 +447,8 @@ def saved_pipeline_run(run_id):
         "workflow_progress": workflow_progress,
         "started_at": aggregate.get("started_at"),
         "completed_at": aggregate.get("completed_at"),
-        "combined_output": str(combined.resolve()),
+        "combined_output": (f"database {data_store.ARTIFACT} {run_id} AGGREGATE" if in_database
+                            else str(combined.resolve())),
         "summary_output": str(summary.resolve()) if summary.exists() else None,
         "message": (aggregate.get("error") or
                     ("Pipeline completed with one or more assessment errors."
@@ -350,16 +470,10 @@ def pipeline_run(run_id):
     return {**live, **saved} if live and saved else saved or live
 
 
-def saved_run_aggregate(run_id):
+def saved_run_aggregate(run_id, stamp=None):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run_id):
         return None
-    combined = REMEDIATION_RUNS_DIR / f"grouped_remediation_{run_id}.json"
-    if not combined.is_file():
-        return None
-    try:
-        value = json.loads(combined.read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
-        return None
+    value = run_json(run_id, "AGGREGATE", REMEDIATION_RUNS_DIR / f"grouped_remediation_{run_id}.json", stamp)
     if not isinstance(value, dict):
         return None
     # CVEs re-assessed after their server's script output was pasted (this run only).
@@ -375,10 +489,7 @@ def context_reassessment_path(run_id):
 
 
 def load_context_reassessments(run_id):
-    try:
-        data = json.loads(context_reassessment_path(run_id).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    data = run_json(run_id, "CONTEXT_REASSESSMENTS", context_reassessment_path(run_id))
     return data if isinstance(data, dict) else {}
 
 
@@ -1227,10 +1338,7 @@ def load_answered_compatibility(run_id):
     """Compatibility results re-checked after the user answered questions (run_id/...json)."""
     if not run_id or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", str(run_id)):
         return {}
-    try:
-        data = json.loads(answered_compatibility_path(run_id).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    data = run_json(run_id, "COMPATIBILITY_ANSWERS", answered_compatibility_path(run_id))
     return data if isinstance(data, dict) else {}
 
 
@@ -1541,32 +1649,39 @@ def public_remediation_results(aggregate):
 async def upload_csv(request: Request, file: UploadFile | None = File(default=None)):
     upload = file
     if upload is None or not upload.filename:
-        return error("Choose a CSV file to upload.")
+        return error("Choose a CSV or XLSX file to upload.")
 
-    if Path(upload.filename).suffix.lower() != ".csv":
-        return error("Only CSV files are accepted by this interface.")
+    suffix = Path(upload.filename).suffix.lower()
+    if suffix not in (".csv", ".xlsx"):
+        return error("Only CSV and XLSX (Excel) files are accepted by this interface.")
 
     data = await upload.read(MAX_UPLOAD_BYTES + 1)
     if len(data) > MAX_UPLOAD_BYTES:
-        return error("The CSV is larger than the 25 MB upload limit.", 413)
+        return error("The file is larger than the 25 MB upload limit.", 413)
     if not data:
-        return error("The uploaded CSV is empty.")
+        return error("The uploaded file is empty.")
 
-    try:
-        decoded = data.decode("utf-8-sig")
-        original_count = sum(1 for _ in csv.DictReader(io.StringIO(decoded)))
-    except UnicodeDecodeError:
-        return error("The CSV must use UTF-8 encoding.")
+    if suffix == ".csv":
+        try:
+            decoded = data.decode("utf-8-sig")
+            original_count = sum(1 for _ in csv.DictReader(io.StringIO(decoded)))
+        except UnicodeDecodeError:
+            return error("The CSV must use UTF-8 encoding.")
 
     temp_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as temporary:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temporary:
             temporary.write(data)
             temp_path = Path(temporary.name)
+        # An XLSX is read from its first (active) worksheet.
         source_rows = read_source_file(temp_path)
+        if suffix == ".xlsx":
+            original_count = len(source_rows)
         records, skipped_rows = build_records(source_rows)
         if not records:
-            raise ValueError("No valid CVE IDs were found in the uploaded CSV.")
+            raise ValueError("No valid CVE IDs were found in the uploaded file.")
+    except zipfile.BadZipFile:
+        return error("The XLSX file could not be opened; save it again from Excel as .xlsx.")
     except Exception as exc:
         return error(str(exc))
     finally:
@@ -1597,6 +1712,13 @@ async def upload_csv(request: Request, file: UploadFile | None = File(default=No
         "owner_email": request_user(request).get("email"),
     }
 
+    try:
+        data_store.save_upload(job_id, JOBS[job_id]["filename"], JOBS[job_id]["owner_id"],
+                               sha256=hashlib.sha256(data).hexdigest(), original_count=original_count,
+                               rows=deduplicated_rows, records=records, skipped_count=len(skipped_rows),
+                               duplicate_count=duplicate_count, columns=columns)
+    except Exception as exc:  # noqa: BLE001 - the upload job itself is already saved
+        db_problem("saving the upload", exc)
     saved_enrichments = reusable_enrichment_files(request)
     return {
         "job_id": job_id,
@@ -1621,19 +1743,34 @@ def enrich_range(request: Request, payload: dict | None = Body(default=None)):
     if not job or not may_access(request, job.get("owner_id")):
         return error("The upload session was not found. Upload the CSV again.", 404)
 
-    try:
-        start = int(payload.get("start", 1))
-        count = int(payload.get("count", 0))
-    except (TypeError, ValueError):
-        return error("Start row and row count must be whole numbers.")
-
     total = len(job["records"])
-    if start < 1 or start > total:
-        return error(f"Start row must be between 1 and {total}.")
-    if count < 1 or start + count - 1 > total:
-        return error(f"Select between 1 and {total - start + 1} rows.")
-
-    selected = job["records"][start - 1 : start - 1 + count]
+    explicit_rows = payload.get("rows")
+    start = count = None
+    if explicit_rows is not None:
+        # The table the user was looking at had a filter active: enrich exactly the rows
+        # that passed it (1-based positions into job["records"], the same numbering the
+        # "deduplicated" table shows), not a start/count slice of the unfiltered set.
+        try:
+            rows = sorted({int(n) for n in explicit_rows})
+        except (TypeError, ValueError):
+            return error("Selected rows must be whole numbers.")
+        if not rows:
+            return error("No rows matched the active filter; clear it or pick different rows.")
+        if rows[0] < 1 or rows[-1] > total:
+            return error(f"Row numbers must be between 1 and {total}.")
+        selected = [job["records"][n - 1] for n in rows]
+    else:
+        try:
+            start = int(payload.get("start", 1))
+            count = int(payload.get("count", 0))
+        except (TypeError, ValueError):
+            return error("Start row and row count must be whole numbers.")
+        if start < 1 or start > total:
+            return error(f"Start row must be between 1 and {total}.")
+        if count < 1 or start + count - 1 > total:
+            return error(f"Select between 1 and {total - start + 1} rows.")
+        rows = None
+        selected = job["records"][start - 1 : start - 1 + count]
 
     try:
         # A CVE with no description of its own gets NVD's as source text; afterwards an
@@ -1652,12 +1789,17 @@ def enrich_range(request: Request, payload: dict | None = Body(default=None)):
     except Exception as exc:
         return error(f"Enrichment failed: {exc}", 500)
 
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    write_csv(DATA_DIR / f"{payload.get('job_id')}.csv", enriched_rows, COMPONENT_COLUMNS)
+    saved_name = f"{payload.get('job_id')}.csv"
+    try:
+        data_store.save_enrichment(saved_name, enriched_rows, upload_id=str(payload.get("job_id")),
+                                   owner_id=job.get("owner_id"), source="new_enrichment")
+    except Exception as exc:  # noqa: BLE001 - the enrichment is kept in a file instead
+        db_problem("saving the enrichment", exc)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        write_csv(DATA_DIR / saved_name, enriched_rows, COMPONENT_COLUMNS)
     result = grouped_payload(
-        str(payload.get("job_id")), enriched_rows, "new_enrichment",
-        f"{payload.get('job_id')}.csv")
-    result.update({"start": start, "count": count})
+        str(payload.get("job_id")), enriched_rows, "new_enrichment", saved_name)
+    result.update({"start": start, "count": count, "rows": rows})
     return result
 
 
@@ -1689,6 +1831,60 @@ def fill_hosts_from_upload(rows, records):
     return filled
 
 
+def fill_types_from_upload(rows, records):
+    """Give reused enrichment rows without a Scanner Type the type of the current upload.
+
+    Enrichment files made before the Scanner Type column existed leave it empty, so OS
+    findings never took the OS route. The uploaded scan has the type of each finding
+    (records[cve].contexts[].scanner_type, per application, OS and servers). A row whose
+    matching findings have one type gets it; a row whose servers have different types is
+    split into one row per type with that type's servers. Returns how many rows were filled.
+    """
+    by_cve = {}
+    for record in (records.values() if isinstance(records, dict) else records or []):
+        contexts = [c for c in record.get("contexts") or [] if str(c.get("scanner_type") or "").strip()]
+        if contexts:
+            by_cve[str(record.get("cve_id") or "").upper()] = contexts
+    if not by_cve:
+        return 0
+    filled, index = 0, 0
+    while index < len(rows):
+        row = rows[index]
+        index += 1
+        if str(row.get("Scanner Type") or "").strip():
+            continue
+        cves = dict.fromkeys(c.upper() for c in re.findall(r"\bCVE-\d{4}-\d{4,}\b", str(row.get("CVE IDs") or ""), re.I))
+        contexts = [c for cve in cves for c in by_cve.get(cve, [])]
+        applications = {a.strip().casefold() for a in str(row.get("Application") or "").split("|") if a.strip()}
+        systems = {o.strip().casefold() for o in str(row.get("Operating System") or "").split("|") if o.strip()}
+        matching = [c for c in contexts
+                    if (not applications or str(c.get("application") or "").casefold() in applications)
+                    and (not systems or str(c.get("operating_system") or "").casefold() in systems)] or contexts
+        kinds = {}
+        for context in matching:
+            kinds.setdefault(str(context["scanner_type"]).strip(), []).extend(context.get("hosts") or [])
+        if len(kinds) == 1:
+            row["Scanner Type"] = next(iter(kinds))
+            filled += 1
+            continue
+        servers = [s.strip() for s in str(row.get("Hostname") or "").split("|") if s.strip()]
+        if len(kinds) < 2 or not servers:
+            continue    # no type, or mixed types with no servers to split by: left empty
+        parts = []
+        for kind, hosts in sorted(kinds.items()):
+            mine = [s for s in servers if s.casefold() in {h.casefold() for h in hosts}]
+            if not mine:
+                continue
+            entries = [e.strip() for e in str(row.get("Hosts") or "").split("|")
+                       if e.strip() and e.strip().rsplit(":", 1)[-1].strip().casefold() in {m.casefold() for m in mine}]
+            parts.append({**row, "Scanner Type": kind, "Hostname": " | ".join(mine), "Hosts": " | ".join(entries)})
+        if parts:
+            rows[index - 1:index] = parts
+            index += len(parts) - 1
+            filled += len(parts)
+    return filled
+
+
 @app.post("/api/enrich/reuse")
 def reuse_enrichment(request: Request, payload: dict | None = Body(default=None)):
     payload = payload or {}
@@ -1701,14 +1897,35 @@ def reuse_enrichment(request: Request, payload: dict | None = Body(default=None)
     if filename not in available or Path(filename).name != filename:
         return error("The selected saved enrichment file is no longer available.", 404)
     try:
-        enriched_rows = read_enriched_csv(DATA_DIR / filename)
+        saved_rows = None
+        try:
+            saved_rows = data_store.load_enrichment(filename)
+        except Exception as exc:  # noqa: BLE001 - a file of that name is read instead
+            db_problem("reading the enrichment", exc)
+        if saved_rows:
+            enriched_rows = [normalize_enriched_row(row) for row in saved_rows]
+        else:
+            enriched_rows = read_enriched_csv(DATA_DIR / filename)
         filled = fill_hosts_from_upload(enriched_rows, JOBS[job_id].get("records"))
+        typed = fill_types_from_upload(enriched_rows, JOBS[job_id].get("records"))
         result = grouped_payload(job_id, enriched_rows, "saved_enrichment", filename)
         if filled:
             result["hosts_filled"] = filled
+        if typed:
+            result["types_filled"] = typed
     except (OSError, ValueError, csv.Error) as exc:
         return error(f"Could not reuse saved enrichment: {exc}")
     return result
+
+
+def selected_applications(rows):
+    """Middleware systems (Application column, pipe separated) named in these rows."""
+    names = {}
+    for row in rows:
+        for name in str(row.get("Application") or "").split("|"):
+            if name.strip():
+                names.setdefault(name.strip().casefold(), name.strip())
+    return sorted(names.values(), key=str.casefold)
 
 
 @app.post("/api/pipeline-runs")
@@ -1729,7 +1946,17 @@ def start_selected_pipeline(request: Request, payload: dict | None = Body(defaul
         return error("One or more selected components are no longer available.")
 
     selected_rows = [grouped_rows[index] for index in indices]
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # Middleware systems (Application column) to run for, chosen in the UI before the run.
+    raw_applications = payload.get("applications")
+    applications = None
+    if raw_applications is not None:
+        if not isinstance(raw_applications, list) or not raw_applications                 or any(not isinstance(name, str) or not name.strip() for name in raw_applications):
+            return error("Choose at least one middleware system to run for.")
+        available = {name.casefold(): name for name in selected_applications(selected_rows)}
+        unknown = [name for name in raw_applications if name.strip().casefold() not in available]
+        if unknown:
+            return error("These middleware systems are not in the selected rows: " + ", ".join(unknown))
+        applications = list(dict.fromkeys(available[name.strip().casefold()] for name in raw_applications))
     first_run_id = job.get("run_id") or job_id
     active_run = next((run for run in PIPELINE_RUNS.values(status=("queued", "running"))
                        if run.get("job_id") == job_id or run.get("run_id") == first_run_id), None)
@@ -1743,7 +1970,21 @@ def start_selected_pipeline(request: Request, payload: dict | None = Body(defaul
     run_id = first_run_id if pipeline_run(first_run_id) is None else generated_run_id()
     while pipeline_run(run_id) is not None:
         run_id = generated_run_id()
-    selected_path = DATA_DIR / f"selected_components_{run_id}.csv"
+    selected_input = f"database {data_store.SELECTION} {run_id}"
+    try:
+        data_store.save_selection(run_id, selected_rows)
+    except Exception as exc:  # noqa: BLE001 - the selection is kept in data/ instead
+        db_problem("saving the selection", exc)
+        selected_input = None
+    if selected_input:
+        # The runner reads a CSV: a temporary copy, deleted when the run ends.
+        handle, name = tempfile.mkstemp(prefix=f"selected_components_{run_id}_", suffix=".csv")
+        os.close(handle)
+        selected_path = Path(name)
+    else:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        selected_path = DATA_DIR / f"selected_components_{run_id}.csv"
+        selected_input = str(selected_path.resolve())
     write_csv(selected_path, selected_rows, COMPONENT_COLUMNS)
     PIPELINE_RUNS[run_id] = {
         "run_id": run_id,
@@ -1755,12 +1996,13 @@ def start_selected_pipeline(request: Request, payload: dict | None = Body(defaul
             {"product": row.get("Product", ""), "component": row.get("Component", "")}
             for row in selected_rows
         ],
+        "selected_applications": applications,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "selected_input": str(selected_path.resolve()),
+        "selected_input": selected_input,
         "context_source": describe_inventory([path.resolve() for path in REMEDIATION_INVENTORY]),
     }
     record_run_event(auth_service.record_run, run_id, current_session_id(request), job.get("filename"), "queued")
-    Thread(target=execute_selected_pipeline, args=(run_id, selected_path), daemon=True).start()
+    Thread(target=execute_selected_pipeline, args=(run_id, selected_path, applications), daemon=True).start()
     return JSONResponse(PIPELINE_RUNS[run_id], status_code=202)
 
 
@@ -1863,7 +2105,7 @@ def manual_compatibility_rule(payload: dict | None = Body(default=None)):
 
 
 @app.post("/api/compatibility/rules/bulk")
-def bulk_compatibility_rules(payload: dict | None = Body(default=None)):
+def bulk_compatibility_rules(request: Request, payload: dict | None = Body(default=None)):
     """Several hand-entered rules at once (the Compatibility rules page; no model call).
 
     {"rules": [<manual_rule payload>, ...], "save": false} checks every rule and returns its
@@ -1890,7 +2132,7 @@ def bulk_compatibility_rules(payload: dict | None = Body(default=None)):
         return {"checked": checked, "errors": errors, "saved": 0}
     try:
         for entry in checked:
-            entry["saved"] = save_rule(entry["proposal"])
+            entry["saved"] = save_rule(entry["proposal"], changed_by=rule_author(request))
     except Exception as exc:  # noqa: BLE001 - reported; earlier rules of the batch stay saved
         return error(f"Saving the rules stopped: {type(exc).__name__}: {exc}", 500)
     return {"checked": checked, "errors": 0, "saved": len(checked)}
@@ -1920,14 +2162,14 @@ def compatibility_config():
 
 
 @app.post("/api/compatibility/rules/{draft_id}/apply")
-def apply_compatibility_rule(draft_id: str):
+def apply_compatibility_rule(draft_id: str, request: Request):
     proposal = COMPATIBILITY_RULE_DRAFTS.pop(draft_id, None)
     if proposal is None:
         return error("Rule draft was not found; draft it again.", 404)
     try:
         from compatibility.rule_contributions import save_rule
 
-        saved = save_rule(proposal)
+        saved = save_rule(proposal, changed_by=rule_author(request))
     except Exception as exc:
         COMPATIBILITY_RULE_DRAFTS[draft_id] = proposal
         return error(f"Could not save the compatibility rule: {exc}")
@@ -2078,6 +2320,10 @@ def run_session_context_path(run_id, item):
     return REMEDIATION_RUNS_DIR / str(run_id) / f"session_context_{key}.json"
 
 
+def run_session_context_kind(run_id, item):
+    return "SESSION_CONTEXT:" + run_session_context_path(run_id, item).stem.removeprefix("session_context_")
+
+
 def compatibility_provider(run_id, item):
     """The inventory provider, or the run-only host when this card's CVE had no server."""
     from compatibility import provider_from_env
@@ -2085,9 +2331,8 @@ def compatibility_provider(run_id, item):
     base = provider_from_env(REMEDIATION_INVENTORY)
     if item.get("host"):
         return base
-    try:
-        host = json.loads(run_session_context_path(run_id, item).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    host = run_json(run_id, run_session_context_kind(run_id, item), run_session_context_path(run_id, item))
+    if not isinstance(host, dict):
         return base
     return RunHostProvider(host, base)
 
@@ -2135,16 +2380,11 @@ def reassess_with_context(run_id, item, host, provider):
     with ANSWER_LOCK:
         stored = load_context_reassessments(run_id)
         stored[answer_item_key(item)] = update
-        path = context_reassessment_path(run_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        pending = path.with_name(path.name + ".tmp")
-        pending.write_text(json.dumps(stored, ensure_ascii=False, default=str), encoding="utf-8")
-        pending.replace(path)
+        save_run_json(run_id, "CONTEXT_REASSESSMENTS", stored, context_reassessment_path(run_id))
         # The re-assessment replaces any compatibility re-checked before it.
         answered = load_answered_compatibility(run_id)
         if answered.pop(answer_item_key(item), None) is not None:
-            answered_compatibility_path(run_id).write_text(json.dumps(answered, ensure_ascii=False),
-                                                           encoding="utf-8")
+            save_run_json(run_id, "COMPATIBILITY_ANSWERS", answered, answered_compatibility_path(run_id))
     return {**item, **update}
 
 
@@ -2153,11 +2393,7 @@ def store_answered_compatibility(run_id, item, result):
     with ANSWER_LOCK:
         stored = load_answered_compatibility(run_id)
         stored[answer_item_key(item)] = result
-        path = answered_compatibility_path(run_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        pending = path.with_name(path.name + ".tmp")
-        pending.write_text(json.dumps(stored, ensure_ascii=False), encoding="utf-8")
-        pending.replace(path)
+        save_run_json(run_id, "COMPATIBILITY_ANSWERS", stored, answered_compatibility_path(run_id))
 
 
 @app.post("/api/compatibility/context")
@@ -2194,12 +2430,11 @@ def compatibility_server_context(request: Request, payload: dict | None = Body(d
             host = (provider.host_for(item.get("context") or {})
                     or provider.host_by_name(stored.get("hostname") or server))
         else:
-            # No server for this CVE: nothing is stored in the inventory or Oracle. The host
-            # lives in this run's folder and is used only for this card.
+            # No server for this CVE: nothing is stored in the inventory. The host is kept
+            # with this run (CVE_RUN_ARTIFACT) and is used only for this card.
             host, report = self_service.host_from_upload(text, "", applications)
-            path = run_session_context_path(run_id, item)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(host, default=str), encoding="utf-8")
+            save_run_json(run_id, run_session_context_kind(run_id, item), host,
+                          run_session_context_path(run_id, item))
             stored = {"server": None, "hostname": host.get("hostname"), "run_only": True,
                       "os": (host.get("os") or {}).get("name") or (host.get("os") or {}).get("kind"),
                       "components": len(host.get("components") or []), "status": report["status"],
@@ -2242,6 +2477,20 @@ def session_remediation_results(job_id, request: Request):
     return {"runs": results}
 
 
+def fix_component(value) -> str:
+    """A component as fix keys compare it: "Unspecified component" and an empty one (an OS
+    finding, whose component grouping clears) are the same."""
+    text = str(value or "").strip().casefold()
+    return "" if text in ("unspecified", "unspecified component") else text
+
+
+def saved_fix_match_keys(item) -> set:
+    """The keys a saved result matches: its own, and the one without a component, so a grouped
+    row with no component (an OS finding) finds the fixes saved for its CVE, product and server."""
+    key = saved_fix_key(item)
+    return {key, (key[0], key[1], "", key[3])}
+
+
 def saved_fix_key(item):
     context = item.get("context") or {}
     component = (item.get("component_name")
@@ -2251,7 +2500,7 @@ def saved_fix_key(item):
                           if entry.get("name")), ""))
     return (str(item.get("cve") or "").upper(),
             str(item.get("product_group") or "").strip().casefold(),
-            str(component or "").strip().casefold(),
+            fix_component(component),
             # Server the assessment was for; "" for rows/runs without one.
             str(item.get("host") or "").strip().casefold())
 
@@ -2313,7 +2562,8 @@ def saved_fix_is_reviewable(item):
     # A result saved from an earlier synthetic/test context must not resurface once observed
     # inventory covers its application: it describes versions the real host may not have.
     request_context = context.get("request") or {}
-    if (request_context.get("context_kind") != "OBSERVED_HOST_INVENTORY"
+    # Application+OS context (inventory/applications/) is collected context too, not a test one.
+    if (request_context.get("context_kind") not in ("OBSERVED_HOST_INVENTORY", "APPLICATION_OS_CONTEXT")
             and observed_inventory_covers(context)):
         return False
     # An inventory edited after the assessment may have changed the facts it used.
@@ -2375,7 +2625,7 @@ def row_fix_keys(row):
         re.findall(r"\bCVE-\d{4}-\d{4,}\b", str(row.get("CVE IDs") or ""), re.I))]
     servers = servers_by_cve(row.get("Hosts") or "", cves) if row.get("Hosts") else {}
     product = str(row.get("Product") or "").casefold()
-    component = str(row.get("Component") or "").casefold()
+    component = fix_component(row.get("Component"))
     return {(cve, product, component, host.strip().casefold())
             for cve in cves for host in ["", *servers.get(cve, [])]}
 
@@ -2408,12 +2658,9 @@ def inventory_signature():
     return tuple(signature)
 
 
-def cached_reviewable(path, position, item, signature):
-    try:
-        modified = path.stat().st_mtime_ns
-    except OSError:
-        modified = None
-    key = (str(path), modified, position, signature)
+def cached_reviewable(version, position, item, signature):
+    """version: (run_id, when its saved result last changed)."""
+    key = (version, position, signature)
     cached = REVIEWABLE_CACHE.get(key)
     now = time.monotonic()
     if cached and now - cached[1] < REVIEWABLE_CACHE_SECONDS:
@@ -2433,10 +2680,25 @@ def reviewable_saved_fix_runs(wanted=None, exclude_run_id="", request=None):
     """
     found = []
     signature = inventory_signature()
+    # Saved UI runs: those in the database, then run files from before it held them.
+    versions = {}
+    try:
+        versions = {run_id: stamp for run_id, stamp in data_store.artifact_stamps("AGGREGATE").items()
+                    if run_id.startswith("ui-")}
+    except Exception as exc:  # noqa: BLE001 - the run files are still read
+        db_problem("listing saved runs", exc)
+    stamps = dict(versions)
     for path in REMEDIATION_RUNS_DIR.glob("grouped_remediation_ui-*.json"):
-        if request is not None and not may_access(request, run_owner(path.stem.removeprefix("grouped_remediation_"))):
+        run_id = path.stem.removeprefix("grouped_remediation_")
+        if run_id not in versions:
+            try:
+                versions[run_id] = path.stat().st_mtime_ns
+            except OSError:
+                continue
+    for run_id, version in versions.items():
+        if request is not None and not may_access(request, run_owner(run_id)):
             continue
-        aggregate = saved_run_aggregate(path.stem.removeprefix("grouped_remediation_"))
+        aggregate = saved_run_aggregate(run_id, stamps.get(run_id))
         if (not aggregate or aggregate.get("run_id") == exclude_run_id
                 or aggregate.get("status") not in ("completed", "completed_with_errors")):
             continue
@@ -2444,10 +2706,9 @@ def reviewable_saved_fix_runs(wanted=None, exclude_run_id="", request=None):
         for position, item in enumerate(aggregate.get("results", [])):
             if not isinstance(item, dict):
                 continue
-            key = saved_fix_key(item)
-            if wanted is not None and key not in wanted:
+            if wanted is not None and not (saved_fix_match_keys(item) & wanted):
                 continue
-            if cached_reviewable(path, position, item, signature):
+            if cached_reviewable((run_id, version), position, item, signature):
                 matching.append({**item, "reasoning": item["remediation_result"]["decision"]})
         if matching:
             found.append({**aggregate, "results": matching})
@@ -2507,7 +2768,9 @@ def grouped_fix_history(job_id, request: Request):
             for item in run["results"]:
                 decision = item["remediation_result"].get("decision") or {}
                 remedy = decision.get("recommended_remediation") or {}
-                for index in rows_by_key.get(saved_fix_key(item), []):
+                indices = dict.fromkeys(index for key in saved_fix_match_keys(item)
+                                        for index in rows_by_key.get(key, []))
+                for index in indices:
                     fixes_by_row.setdefault(index, []).append({
                         "cve": str(item.get("cve") or "").upper(),
                         "run_id": run.get("run_id"),
@@ -2636,14 +2899,23 @@ def job_middleware(job_id, request: Request):
     """The uploaded file as middleware -> product (with its components) -> CVEs, each CVE with
     its servers and the fix from this upload's runs or, failing that, an earlier saved run.
     Nothing is written and no agent is called."""
+    job, tree = job_middleware_tree(job_id, request)
+    if job is None:
+        return tree
+    return {**tree, "rows": len(job.get("grouped_rows") or []),
+            "source_filename": job.get("source_filename") or job.get("filename")}
+
+
+def job_middleware_tree(job_id, request):
+    """(job, middleware_tree) for an upload, or (None, error response)."""
     from delivery import agent as delivery_agent
 
     job = JOBS.get(job_id)
     if not job or not may_access(request, job.get("owner_id")):
-        return error("The upload session was not found. Upload the CSV again.", 404)
+        return None, error("The upload session was not found. Upload the CSV again.", 404)
     rows = job.get("grouped_rows") or []
     if not rows:
-        return error("Enrich and group the file first: the middleware view is built from its grouped components.")
+        return None, error("Enrich and group the file first: the middleware view is built from its grouped components.")
     results = []
     for run in sorted(PIPELINE_RUNS.values(job_id=job_id), key=lambda run: run.get("created_at") or ""):
         aggregate = saved_run_aggregate(run["run_id"])
@@ -2652,8 +2924,96 @@ def job_middleware(job_id, request: Request):
     wanted = {key for row in rows for key in row_fix_keys(row)}
     for run in reviewable_saved_fix_runs(wanted, request=request):
         results += [{**result, "_origin": "saved"} for result in public_remediation_results(run)["results"]]
-    return {**delivery_agent.middleware_tree(rows, results), "rows": len(rows),
-            "source_filename": job.get("source_filename") or job.get("filename")}
+    return job, delivery_agent.middleware_tree(rows, results)
+
+
+def middleware_git_products(job_id, request, payload):
+    """(middleware name, chosen products with versions) for the git artifact, or (None, error)."""
+    from delivery import agent as delivery_agent
+
+    payload = payload or {}
+    job, tree = job_middleware_tree(job_id, request)
+    if job is None:
+        return None, tree
+    name = str(payload.get("middleware") or "")
+    entry = next((m for m in tree["middlewares"] if m["middleware"] == name), None)
+    if entry is None:
+        return None, error("That middleware is not in this upload.", 404)
+    wanted = [str(p) for p in payload.get("products") or [] if str(p).strip()]
+    if not wanted:
+        return None, error("Choose at least one product.")
+    # Application+OS context for this middleware (inventory/applications/), any OS it was collected on.
+    context_hosts = [h for h in (observed_hosts() or [])
+                     if h.get("_app_scope") and str(h.get("_app_name") or "").casefold() == name.casefold()]
+    import host_inventory   # importable once observed_hosts() has put context_gathered on sys.path
+
+    def context_version(product):
+        for host in context_hosts:
+            version = next((c.get("installed_version") for c in host_inventory._components_for(host, product)
+                            if c.get("installed_version")), None)
+            if version:
+                return version, f"Application+OS context ({(host.get('os') or {}).get('name') or 'unknown OS'})"
+        return None
+
+    products = delivery_agent.middleware_products(entry, wanted, context_version)
+    if not products:
+        return None, error("None of the chosen products is under this middleware.")
+    platforms = list(dict.fromkeys((h.get("os") or {}).get("name") for h in context_hosts
+                                   if (h.get("os") or {}).get("name")))
+    return name, (products, platforms)
+
+
+@app.post("/api/jobs/{job_id}/middleware/git/pull")
+def middleware_git_pull(job_id, request: Request, payload: dict | None = Body(default=None)):
+    """The middleware's config file from its GitHub repository (DUMMY file when none is set up)."""
+    from delivery import agent as delivery_agent
+    from delivery.config_repo import ConfigRepoError
+
+    name, chosen = middleware_git_products(job_id, request, payload)
+    if name is None:
+        return chosen
+    products, platforms = chosen
+    try:
+        return delivery_agent.pull_middleware(name, products, platforms)
+    except (ConfigRepoError, ValueError) as exc:
+        return error(str(exc), 502 if isinstance(exc, ConfigRepoError) else 400)
+
+
+@app.post("/api/jobs/{job_id}/middleware/git/artifact")
+def middleware_git_artifact(job_id, request: Request, payload: dict | None = Body(default=None)):
+    """Write the updated config file (fix versions) as an artifact ready to commit."""
+    from delivery import agent as delivery_agent
+    from delivery.config_repo import ConfigRepoError
+
+    name, chosen = middleware_git_products(job_id, request, payload)
+    if name is None:
+        return chosen
+    products, platforms = chosen
+    try:
+        return delivery_agent.write_middleware_artifact(name, products, request_user(request).get("user_id"),
+                                                        platforms=platforms)
+    except (ConfigRepoError, ValueError) as exc:
+        return error(str(exc), 502 if isinstance(exc, ConfigRepoError) else 400)
+
+
+@app.post("/api/jobs/{job_id}/middleware/git/push")
+def middleware_git_push(job_id, request: Request, payload: dict | None = Body(default=None)):
+    """Send an artifact's updated config file to its middleware's repository: a pull request
+    into the configured branch (default), or a commit straight to it (mode "direct")."""
+    from delivery import agent as delivery_agent
+    from delivery.config_repo import ConfigRepoError
+
+    folder = delivery_agent.find_middleware_artifact(str((payload or {}).get("artifact_id") or ""))
+    if folder is None:
+        return error("That artifact was not found. Create the updated artifact again.", 404)
+    manifest = delivery_agent.read_manifest(folder)
+    if not may_access(request, manifest.get("created_by")):
+        return error("That artifact was not found. Create the updated artifact again.", 404)
+    try:
+        manifest = delivery_agent.push_middleware_artifact(folder, request_user(request).get("user_id"))
+    except ConfigRepoError as exc:
+        return error(str(exc), 502)
+    return {key: manifest.get(key) for key in ("artifact_id", "middleware", "repo", "branch", "path", "push")}
 
 
 @app.post("/api/delivery/artifacts")
@@ -2761,6 +3121,64 @@ def job_servers(rows):
         common = set.intersection(*sets) if sets else set()
         entry["scanner_os"] = next(iter(common)) if len(common) == 1 else None
     return servers
+
+
+def job_applications(rows, enriched_rows=None):
+    """Application+OS groups named in the grouped rows: every server that shares both an
+    application and its own scanner-reported OS (job_servers) rolls into one group, the
+    primary unit context is now gathered and uploaded for (see host_inventory.py scope:
+    application). A server whose OS is not uniquely known from the scanner rows (several
+    different OS names across its rows) is left out: an Application+OS context is only ever
+    matched by its exact OS string, so it is never guessed."""
+    groups: dict[tuple, dict] = {}
+    for entry in job_servers(rows):
+        os_name = entry.get("scanner_os")
+        if not os_name:
+            continue
+        for application in entry["applications"] or ["Unspecified Application"]:
+            key = (application.casefold(), os_name.strip().casefold())
+            group = groups.setdefault(key, {"application": application, "os": os_name,
+                                            "servers": [], "products": {}})
+            group["servers"].append(entry["server"])
+            for item in entry["products"]:
+                merged = group["products"].setdefault(
+                    item["product"].casefold(), {"product": item["product"], "names": [], "cves": []})
+                merged["names"] = list(dict.fromkeys(merged["names"] + item["names"]))
+                merged["cves"] = list(dict.fromkeys(merged["cves"] + item["cves"]))
+    # A row with no Hosts still names its application and OS: the context is gathered per
+    # Application+OS, not per server, so the pair is listed (with no servers). Grouping merges
+    # OS variants (Red Hat 7.9 / Red Hat Server 7.9) and loses which application runs on which,
+    # so the ungrouped rows (one OS each) are used when the job has them.
+    from product_names import unify_products
+    plain = [row for row in (enriched_rows if enriched_rows is not None else rows) if not row.get("Hosts")]
+    spelling = unify_products(str(row.get("Product") or "").strip() for row in [*rows, *plain])
+    for row in plain:
+        if row.get("Hosts"):
+            continue
+        systems = list(dict.fromkeys(name.strip() for name in str(row.get("Operating System") or "").split(" | ")
+                                     if name.strip()))
+        if len(systems) != 1:
+            continue
+        cves = [cve.upper() for cve in dict.fromkeys(
+            re.findall(r"\bCVE-\d{4}-\d{4,}\b", str(row.get("CVE IDs") or ""), re.I))]
+        product = spelling.get(str(row.get("Product") or "").strip()) or "Unknown product"
+        component = str(row.get("Component") or "").strip()
+        if component.casefold() == "unspecified component":
+            component = ""
+        applications = [name.strip() for name in str(row.get("Application") or "").split(" | ") if name.strip()]
+        for application in applications or ["Unspecified Application"]:
+            group = groups.setdefault((application.casefold(), systems[0].casefold()), {
+                "application": application, "os": systems[0], "servers": [], "products": {}})
+            merged = group["products"].setdefault(product.casefold(), {"product": product, "names": [], "cves": []})
+            if component and component not in merged["names"]:
+                merged["names"].append(component)
+            merged["cves"] = list(dict.fromkeys(merged["cves"] + cves))
+    out = []
+    for group in groups.values():
+        group["servers"] = sorted(dict.fromkeys(group["servers"]))
+        group["products"] = sorted(group["products"].values(), key=lambda p: p["product"].casefold())
+        out.append(group)
+    return sorted(out, key=lambda g: (g["application"].casefold(), g["os"].casefold()))
 
 
 def server_os(job, server):
@@ -2916,6 +3334,123 @@ def context_gatherer_script(payload: dict | None = Body(default=None)):
         return error(f"The script could not be generated: {type(exc).__name__}: {exc}", 500)
     return {key: result[key] for key in ("server", "script", "filename", "run", "probes", "fallback_probes",
                                          "rejected", "coverage", "tokenomics", "error")}
+
+
+@app.get("/api/jobs/{job_id}/application-coverage")
+def application_coverage(job_id, request: Request):
+    """For each Application+OS group in the job: is its context collected
+    (inventory/applications/), and what products does its CVE backlog cover. Primary context
+    unit (see host_inventory.py scope: application): not server wise."""
+    job = JOBS.get(job_id)
+    if not job or not may_access(request, job.get("owner_id")):
+        return error("The upload session was not found. Upload the CSV again.", 404)
+    import host_inventory
+    import self_service
+
+    groups = job_applications(job.get("grouped_rows") or [], job.get("enriched_rows"))
+    try:
+        hosts = [h for h in host_inventory.load_hosts(REMEDIATION_INVENTORY) if h.get("_app_scope")]
+    except (OSError, ValueError) as exc:
+        return error(f"The host inventory could not be read: {exc}", 500)
+    for group in groups:
+        host = next((h for h in hosts if h.get("_app_name", "").casefold() == group["application"].casefold()
+                     and h.get("_app_os") == host_inventory._norm_os(group["os"])), None)
+        group["covered"] = host is not None
+        group["source"] = host.get("_file") if host else None
+        group["collected_at"] = host.get("_collected_at") if host else None
+        group["measured_os"] = (host.get("os") or {}).get("measured_name") if host else None
+        group["context_components"] = len((host or {}).get("components") or [])
+        group["script"] = {
+            "filename": self_service.application_collector_filename(group["application"], group["os"]),
+            "run": self_service.application_collector_run(group["application"], group["os"])}
+        # Per product: is it actually in the uploaded context, and with what version -- so
+        # the UI can highlight each product by whether the context covers it, not just
+        # whether the group as a whole has some file on disk.
+        for product in group["products"]:
+            found = host_inventory._components_for(host, product["product"]) if host else []
+            versioned = [c for c in found if c.get("installed_version")]
+            product["in_context"] = bool(found)
+            product["context_version"] = (versioned or found or [{}])[0].get("installed_version") if found else None
+    return {"groups": groups, "missing": sum(not g["covered"] for g in groups)}
+
+
+@app.get("/api/application-context-script")
+def application_context_script(request: Request, application: str = "", os: str = "", job_id: str = ""):
+    """The read-only collection script for one Application+OS group: focused on the
+    products its CVE backlog names (job_applications), run on any representative server for
+    that application and OS (self_service.build_script, application_mode=True). No model
+    call: script_agent.generate_application_script always uses the rule-based probe plan."""
+    import script_agent
+
+    job = JOBS.get(job_id) if job_id else None
+    if job and not may_access(request, job.get("owner_id")):
+        job = None
+    application, os_name = application.strip()[:200], os.strip()[:120]
+    if not application or not os_name:
+        return error("Pick an application and an operating system.")
+    group = next((g for g in job_applications((job or {}).get("grouped_rows") or [], (job or {}).get("enriched_rows"))
+                 if g["application"].casefold() == application.casefold()
+                 and g["os"].casefold() == os_name.casefold()), None)
+    components = [{"product": p["product"], "component": ", ".join(p["names"]), "cves": p["cves"]}
+                  for p in (group or {}).get("products") or []]
+    if not components:
+        return error("No vulnerable products are selected for this application and operating system.")
+    try:
+        result = script_agent.generate_application_script(application, os_name, components)
+    except ValueError as exc:
+        return error(str(exc))
+    except Exception as exc:  # noqa: BLE001 - reported to the user
+        return error(f"The script could not be generated: {type(exc).__name__}: {exc}", 500)
+    return Response(content=result["script"], media_type="text/x-shellscript",
+                    headers={"Content-Disposition": f'attachment; filename="{result["filename"]}"'})
+
+
+@app.post("/api/application-context-gatherer/script")
+def application_context_gatherer_script(payload: dict | None = Body(default=None)):
+    """The Application+OS collection script for exactly the ticked products (not every
+    product in the group), with the probe plan and coverage returned alongside it so the UI
+    can show what was actually built -- the same shape /api/context-gatherer/script returns
+    for one server. No model call: script_agent.generate_application_script always uses the
+    rule-based probe plan (script_agent.rule_plan / probe_hints)."""
+    import script_agent
+
+    payload = payload or {}
+    application = str(payload.get("application") or "").strip()[:200]
+    os_name = str(payload.get("os") or "").strip()[:120]
+    components = payload.get("components")
+    if not application or not os_name:
+        return error("Pick an application and an operating system.")
+    if not isinstance(components, list) or not components:
+        return error("Select at least one product to generate the script for.")
+    try:
+        result = script_agent.generate_application_script(application, os_name, components)
+    except ValueError as exc:
+        return error(str(exc))
+    except Exception as exc:  # noqa: BLE001 - reported to the user; the download link still works
+        return error(f"The script could not be generated: {type(exc).__name__}: {exc}", 500)
+    return {key: result[key] for key in ("application", "os", "script", "filename", "run",
+                                         "probes", "fallback_probes", "rejected", "coverage")}
+
+
+@app.post("/api/application-context-upload")
+async def application_context_upload(file: UploadFile | None = File(default=None),
+                                      application: str = Form(default=""), os: str = Form(default="")):
+    """Store the output of the Application+OS collection script, replacing any earlier
+    upload for the same application and operating system."""
+    import self_service
+
+    if file is None or not file.filename:
+        return error("Choose the output file of the collection script.")
+    data = await file.read(self_service.MAX_UPLOAD_BYTES + 1)
+    if len(data) > self_service.MAX_UPLOAD_BYTES:
+        return error("The uploaded file is larger than 8 MB.", 413)
+    try:
+        return self_service.save_application_upload(data.decode("utf-8", errors="replace"),
+                                                     application, os)
+    except ValueError as exc:
+        return error(str(exc))
+    except Exception as exc:  # noqa: BLE001 - reported to the user, nothing half-saved matters
+        return error(f"The output could not be converted: {type(exc).__name__}: {exc}", 500)
 
 
 @app.get("/api/health")

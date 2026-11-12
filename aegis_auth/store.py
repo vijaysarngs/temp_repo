@@ -68,6 +68,14 @@ class Store:
         """Context manager: several statements on one connection, committed together (rolled back on error)."""
         raise NotImplementedError
 
+    def execute_many(self, sql: str, rows: list[dict], clobs=()) -> None:
+        """One statement for many rows (bulk insert); `clobs` names the long-text binds."""
+        raise NotImplementedError
+
+    def query_text(self, sql: str, params: dict | None = None) -> list[dict]:
+        """query, with long text (CLOB) returned as plain strings; for reading many rows."""
+        return self.query(sql, params)
+
 
 class _SQLiteTransaction:
     """The lock is already held by SQLiteStore.transaction, so statements go straight to the connection."""
@@ -134,6 +142,18 @@ class SQLiteStore(Store):
         with self._lock:
             cursor = self._connection.execute(sql, self._bind(params))
             return [self._row(cursor, row) for row in cursor.fetchall()]
+
+    def execute_many(self, sql, rows, clobs=()):
+        if not rows:
+            return
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._connection.executemany(sql, [self._bind(row) for row in rows])
+            except BaseException:
+                self._connection.execute("ROLLBACK")
+                raise
+            self._connection.execute("COMMIT")
 
 
 def _oracledb():
@@ -213,6 +233,36 @@ class OracleStore(Store):
             self._run(cursor, sql, params)
             return self._rows(cursor)
 
+    def execute_many(self, sql, rows, clobs=(), batch=1000):
+        if not rows:
+            return
+        oracledb = _oracledb()
+        with self._pool.acquire() as connection:
+            try:
+                with connection.cursor() as cursor:
+                    if clobs:
+                        cursor.setinputsizes(**{name: oracledb.DB_TYPE_CLOB for name in clobs})
+                    for start in range(0, len(rows), batch):
+                        cursor.executemany(sql, rows[start:start + batch])
+            except BaseException:
+                connection.rollback()
+                raise
+            connection.commit()
+
+    def query_text(self, sql, params=None):
+        oracledb = _oracledb()
+
+        def as_text(cursor, metadata):
+            # Fetching each CLOB as a locator costs a round trip per value; as text it does not.
+            if metadata.type_code is oracledb.DB_TYPE_CLOB:
+                return cursor.var(oracledb.DB_TYPE_LONG, arraysize=cursor.arraysize)
+
+        with self._pool.acquire() as connection, connection.cursor() as cursor:
+            cursor.arraysize = 1000
+            cursor.outputtypehandler = as_text
+            self._run(cursor, sql, params)
+            return self._rows(cursor)
+
     @contextmanager
     def transaction(self):
         with self._pool.acquire() as connection:
@@ -247,6 +297,11 @@ def get_store() -> Store:
     global _store
     with _store_lock:
         if _store is None:
+            try:    # the CLI (python -m aegis_auth) must use the same database as the app
+                from dotenv import load_dotenv
+                load_dotenv(ROOT / ".env", override=False)
+            except ImportError:
+                pass
             backend = os.getenv("AEGIS_AUTH_DB", "sqlite").strip().casefold()
             if backend == "oracle":
                 _store = OracleStore()

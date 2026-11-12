@@ -21,6 +21,7 @@ import unicodedata
 from pathlib import Path
 
 import nvd_fallback
+from product_names import canonical_product
 
 # Grouped rows list every CVE-server pair in one Hosts cell (190k+ characters for IBM AIX
 # on ~100 servers), past csv's 128 KiB default. 2**31-1: sys.maxsize overflows on Windows.
@@ -39,15 +40,22 @@ COMPONENT_COLUMNS = [
     # "CVE-...: host" entries from the scanner's host/IP column (optional; grouping keeps
     # which CVE was found on which server, and remediation runs once per server).
     "Hosts",
+    # "server => OS" entries made by grouping (group_cves_by_component.py), so a row that
+    # mixes operating systems still says which server runs which OS.
+    "Host OS",
     # Filled from NVD for CVEs whose description, product, component or application
     # was missing ("CVE-...: value" entries; see nvd_fallback.py).
     "NVD Description", "CVSS", "CWE", "Affected Versions (NVD)", "Fixed Versions (NVD)",
     "Known Exploited",
+    # The scanner's finding type ("OS" or "App"). An OS finding is fixed by the OS vendor's
+    # update on Linux and AIX, and on Windows when the product is Windows itself
+    # (remediation/os_route.py).
+    "Scanner Type",
 ]
 NVD_COLUMNS = ("NVD Description", "CVSS", "CWE", "Affected Versions (NVD)",
                "Fixed Versions (NVD)", "Known Exploited")
 # Columns an older enrichment CSV may lack; they are filled in or left empty when read.
-OPTIONAL_COMPONENT_COLUMNS = ("Component ID", "Hostname", "Hosts", *NVD_COLUMNS)
+OPTIONAL_COMPONENT_COLUMNS = ("Component ID", "Hostname", "Hosts", "Host OS", *NVD_COLUMNS, "Scanner Type")
 UNSPECIFIED_APPLICATION = "Unspecified Application"
 FIELDS = ("product", "component", "affected_symbol", "source_path")
 KINDS = ("subsystem", "module", "driver", "filesystem", "protocol",
@@ -59,7 +67,10 @@ DESCRIPTION_KEYS = (
 )
 CVE_KEYS = ("cve", "cve id", "cve ids", "vulnerability id")
 APPLICATION_KEYS = ("primary application", "application", "app/service")
-OS_KEYS = ("os name", "operating system", "os")
+# "host os" last: a results sheet names the OS that way; a grouped file's "server => OS"
+# entries keep only the OS (host_os_name).
+OS_KEYS = ("os name", "operating system", "os", "host os")
+TYPE_KEYS = ("type", "scanner type", "vulnerability type", "finding type")
 # Scanner columns naming the affected server (IP address or host name).
 HOST_KEYS = ("host", "hostname", "host name", "ip", "ip address", "ipaddress", "ipv4",
              "ip addresses", "dns name", "dns", "fqdn", "asset", "asset name", "server",
@@ -69,6 +80,26 @@ CVE_PATTERN = re.compile(r"\bCVE-\d{4}-\d{4,}\b", re.IGNORECASE)
 
 def clean(value):
     return "" if value is None else str(value).strip()
+
+
+def host_os_name(value):
+    """The OS of an "OS" cell; "server => Windows Server 2019" entries give the OS part."""
+    names = [part.split("=>", 1)[-1].strip() for part in str(value or "").split(" | ")]
+    return " | ".join(dict.fromkeys(name for name in names if name))
+
+
+def cell_text(value):
+    """One XLSX cell as the text a CSV export would hold."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(value).upper()
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    if hasattr(value, "isoformat"):
+        text = value.isoformat()
+        return text[:-9] if text.endswith("T00:00:00") else text
+    return str(value)
 
 
 def component_identifier(product, component):
@@ -149,7 +180,11 @@ def read_source_file(path, sheet_name=None):
                 raise ValueError("XLSX must have nonempty column headers")
             if len(set(headers)) != len(headers):
                 raise ValueError("XLSX has duplicate headers")
-            rows = [dict(zip(headers, values_row)) for values_row in values]
+            # Cells as text, like a CSV gives: numbers without a trailing ".0", dates as
+            # ISO text, empty cells as "". Rows with no value at all (Excel's trailing
+            # formatted rows) are skipped.
+            rows = [dict(zip(headers, (cell_text(value) for value in values_row)))
+                    for values_row in values if any(value not in (None, "") for value in values_row)]
         finally:
             workbook.close()
     else:
@@ -199,7 +234,8 @@ def build_records(rows):
             continue
         context = {
             "application": get_value(row, *APPLICATION_KEYS) or UNSPECIFIED_APPLICATION,
-            "operating_system": get_value(row, *OS_KEYS),
+            "operating_system": host_os_name(get_value(row, *OS_KEYS)),
+            "scanner_type": get_value(row, *TYPE_KEYS),
         }
         hosts = row_hosts(row)
         for cve_id in cve_ids:
@@ -209,7 +245,8 @@ def build_records(rows):
             record["observations"].append({"row_number": row_number, "row": row})
             existing = next((item for item in record["contexts"]
                              if item["application"] == context["application"]
-                             and item["operating_system"] == context["operating_system"]), None)
+                             and item["operating_system"] == context["operating_system"]
+                             and item.get("scanner_type") == context["scanner_type"]), None)
             if existing is None:
                 existing = {**context, "row_numbers": [row_number]}
                 record["contexts"].append(existing)
@@ -611,13 +648,14 @@ def component_rows(records, classifications):
     output = []
     for record in records:
         result = classifications[record["cve_id"]]
-        product = result["product"]["label"] or "Unidentified"
+        product = canonical_product(result["product"]["label"]) or "Unidentified"
         component = result["component"]["label"] or "Unspecified component"
         for context in record["contexts"]:
             cve_id = record["cve_id"]
             row = {
                 "Application": context["application"], "Product": product,
                 "Component": component, "Operating System": context["operating_system"],
+                "Scanner Type": context.get("scanner_type") or "",
                 "Component ID": component_identifier(product, component),
                 "Description": f"Source-named component: {component}." if result["component"]["label"] else "No stable component explicitly identified in the source.",
                 "Component Kind": result["component_kind"],

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -32,9 +32,12 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { ContextGathererView } from "./contextGatherer.jsx";
+// contextGatherer.jsx (per-server context) is superseded by applicationGatherer.jsx
+// (Application+OS context, the primary context unit) and is no longer imported here.
+import { ApplicationGathererView } from "./applicationGatherer.jsx";
 import { CompatRulesView } from "./compatRules.jsx";
 import DeliveryView from "./delivery.jsx";
+import { ThemeToggle } from "./theme.jsx";
 import MiddlewareDeliveryView from "./middlewareDelivery.jsx";
 import { combineRemediationRuns, mergeRemediationRuns, resultAnchor } from "./remediationResults.js";
 import { COLUMN_VALUE_LIMIT, distinctValues, filterRows } from "./tableFilters.js";
@@ -316,108 +319,20 @@ function QuestionsList({ questions, onAnswer }) {
 // Facts a shell can answer: they come from the server's script output, not from a question.
 const HOST_FACT_ASPECTS = new Set(["installed_version", "ownership", "application_usage", "java_runtime", "dependency_version"]);
 
-// The card's own server: download the read-only script, paste what it printed, and the card re-checks.
-function CardServerContext({ item, compatibility, onChecked, onResult }) {
-  const input = useRef(null);
-  const [text, setText] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [failure, setFailure] = useState("");
-  const [stored, setStored] = useState(null);
-  const [show, setShow] = useState(false);
-  const server = item.host || "";
-
-  async function apply(content) {
-    if (!content?.trim()) { setFailure("Paste the output of the script first."); return; }
-    setBusy(true);
-    setFailure("");
-    try {
-      const response = await fetch("/api/compatibility/context", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ run_id: item.run_id, cve: item.cve, component_id: item.component_id,
-          host: item.host || null, text: content }),
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || `Applying the context failed (HTTP ${response.status}).`);
-      setStored({ ...data.context, verdict: data.result?.verdict, version: data.result?.component_version });
-      setText("");
-      // The CVE was re-assessed with this context: the whole card is replaced, not only compatibility.
-      if (data.result && onResult) onResult(data.result);
-      else onChecked(data.compatibility);
-    } catch (error) {
-      setFailure(error.message);
-    } finally {
-      setBusy(false);
-      if (input.current) input.current.value = "";
-    }
-  }
-
-  const open = (compatibility?.questions || []).filter((q) => HOST_FACT_ASPECTS.has(q.aspect));
+// Decisions only the user can make (vendor support, an accepted branch change): each answer
+// re-checks this CVE. Facts a server's script would answer are not asked on the card.
+function CardServerContext({ item, compatibility, onChecked }) {
   const decisions = (compatibility?.questions || []).filter((q) => !HOST_FACT_ASPECTS.has(q.aspect));
+  if (!decisions.length) return null;
   const answer = async (question, value, note) => {
     const data = await postAnswers(item, [{ key: question.key, value, note }]);
     onChecked(data.compatibility);
   };
-  // No open server questions: the paste box stays folded behind one button, so a newer context
-  // (for example an edited inventory YAML) can still re-check this card.
-  if (item.host && !open.length && !stored && !decisions.length && !show) {
-    return (
-      <section className="card-questions">
-        <button type="button" className="button button-secondary button-small" onClick={() => setShow(true)}>
-          <UploadCloud size={14} /> Update server context
-        </button>
-      </section>
-    );
-  }
   return (
     <section className="card-questions">
-      {(open.length > 0 || stored || !item.host || show) && (
-        <div className="card-context">
-          <h3>{server ? `Server context · ${server}` : "Server context · this run only"}</h3>
-          {stored ? (
-            <p className="server-upload-ok"><Check size={13} /> Read {stored.hostname}{stored.run_only ? " for this run only" : ""}{stored.os ? ` (${stored.os})` : ""}:
-              {" "}{stored.components} components.{stored.verdict ? ` Re-assessed: ${humanize(stored.verdict)}` : ""}
-              {stored.version ? `, component version ${stored.version}.` : stored.verdict ? "." : ""} {open.length
-                ? `${open.length} thing${open.length === 1 ? " is" : "s are"} not in this output (listed below).`
-                : "Everything about this server that the check needs was read from the output."}
-              {stored.warnings?.map((warning) => <span key={warning}> {warning}</span>)}</p>
-          ) : (
-            <p>Run the read-only script on this server and paste its whole output. The installed version, who
-              installed it, the Java runtime and the dependencies are read from it, and this card updates.</p>
-          )}
-          {!item.host && <p>The scanner gave this CVE no server. Paste the output of the script from the machine it runs
-            on: it is used for this run's result only and is not stored against any server.</p>}
-          <div className="server-actions-buttons">
-            <a className="button button-secondary button-small"
-              href={`/api/context-script?server=${encodeURIComponent(server || "this-server")}`}><Download size={14} /> Download script</a>
-            <button type="button" className="button button-secondary button-small" disabled={busy}
-              onClick={() => input.current?.click()}><UploadCloud size={14} /> Choose output file</button>
-            <input ref={input} type="file" accept=".txt,text/plain" hidden
-              onChange={async (event) => { const file = event.target.files[0]; if (file) apply(await file.text()); }} />
-          </div>
-          <textarea className="card-context-text" rows={5} value={text} disabled={busy}
-            placeholder={`Paste the output of the collection script (or an inventory YAML) for ${server || "<server>"}`}
-            onChange={(event) => setText(event.target.value)} />
-          <button type="button" className="button button-primary button-small" disabled={busy || !text.trim()}
-            onClick={() => apply(text)}>
-            {busy ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}
-            {busy ? "Reading…" : "Apply server context"}
-          </button>
-          {failure && <p className="server-upload-error"><AlertTriangle size={13} /> {failure}</p>}
-          {stored && open.length > 0 && (
-            <ul className="card-context-missing">
-              {open.map((question) => <li key={question.key}><strong>{ASPECT_LABELS[question.aspect]}:</strong> not
-                in the output. {question.why}</li>)}
-            </ul>
-          )}
-        </div>
-      )}
-      {decisions.length > 0 && (
-        <>
-          <h3>Decisions only you can make ({decisions.length})</h3>
-          <p>A server cannot tell these (vendor support, accepted branch change, contracts); each answer re-checks this CVE and is reused.</p>
-          <QuestionsList questions={decisions} onAnswer={answer} />
-        </>
-      )}
+      <h3>Decisions only you can make ({decisions.length})</h3>
+      <p>A server cannot tell these (vendor support, accepted branch change, contracts); each answer re-checks this CVE and is reused.</p>
+      <QuestionsList questions={decisions} onAnswer={answer} />
     </section>
   );
 }
@@ -1086,92 +1001,122 @@ function AppliedRules({ rules, productKey, target }) {
   );
 }
 
+const CHECK_ORDER = { FAIL: 0, UNKNOWN: 1, WARN: 2, PASS: 3 };
+
+function CheckRow({ check }) {
+  return (
+    <li className="compat-check">
+      <span className={`compat-pill compat-pill-${check.status.toLowerCase()}`}>{check.status}</span>
+      <div><strong>{humanize(check.id)}</strong><span>{check.detail}</span></div>
+    </li>
+  );
+}
+
+function CompatibilityEvaluation({ evaluation, open }) {
+  const checks = evaluation.checks || [];
+  const flagged = checks.filter((check) => check.status !== "PASS")
+    .sort((a, b) => (CHECK_ORDER[a.status] ?? 9) - (CHECK_ORDER[b.status] ?? 9));
+  const passed = checks.filter((check) => check.status === "PASS");
+  const status = String(evaluation.status || "").toLowerCase();
+  return (
+    <details className={`compat-eval compat-eval-${status}`} open={open}>
+      <summary className="compat-eval-summary">
+        <ChevronRight size={15} className="compat-chevron" />
+        <div className="compat-eval-title">
+          <span className="compat-role">{COMPATIBILITY_ROLES[evaluation.role] || humanize(evaluation.role)}</span>
+          <strong>{evaluation.target || "No target"}</strong>
+          <small>{evaluation.component} · installed {evaluation.installed_version || "unknown"} · {humanize(evaluation.ownership)}</small>
+        </div>
+        <div className="compat-eval-side">
+          <span className="compat-tally">
+            {flagged.length ? `${flagged.length} to review` : "All checks passed"} · {passed.length}/{checks.length} passed
+          </span>
+          <span className={`compatibility compatibility-${status}`}>{humanize(evaluation.status)}</span>
+        </div>
+      </summary>
+      <div className="compat-eval-body">
+        {flagged.length > 0 && (
+          <div className="compat-group">
+            <h4>Needs attention ({flagged.length})</h4>
+            <ul className="compat-check-list">{flagged.map((check) => <CheckRow key={check.id + check.detail} check={check} />)}</ul>
+          </div>
+        )}
+        {!!evaluation.required_actions?.length && (
+          <div className="compat-actions">
+            <h4>Required actions</h4>
+            <ol>{evaluation.required_actions.map((action, index) => <li key={index}>{action}</li>)}</ol>
+          </div>
+        )}
+        {passed.length > 0 && (
+          <details className="compat-passed" open={!flagged.length}>
+            <summary>Why this version fits: {passed.length} check(s) passed</summary>
+            <ul className="compat-check-list">{passed.map((check) => <CheckRow key={check.id + check.detail} check={check} />)}</ul>
+          </details>
+        )}
+        <AppliedRules rules={evaluation.applied_rules} productKey={evaluation.product_rules} target={evaluation.target} />
+        {evaluation.model_judgment && (
+          <details className="compat-passed">
+            <summary>Model judgment: {evaluation.model_judgment.validation === "accepted"
+              ? humanize(evaluation.model_judgment.model_status)
+              : evaluation.model_judgment.validation === "no_rules"
+                ? "no matching knowledge rule"
+                : "rejected; inventory checks retained"}</summary>
+            {evaluation.model_judgment.validation === "accepted" ? (
+              <>
+                <p>Rule and fact references were checked. Final status: {humanize(evaluation.model_judgment.status)}.</p>
+                <ul>
+                  {(evaluation.model_judgment.cited_rules || []).map((rule) => (
+                    <li key={rule.id}>{rule.id}: {typeof rule.value === "string"
+                      ? rule.value : JSON.stringify(rule.value)}{rule.source && /^https?:\/\//.test(rule.source)
+                      ? <> · <a href={rule.source} target="_blank" rel="noreferrer">Source</a></> : null}</li>
+                  ))}
+                  {(evaluation.model_judgment.cited_facts || []).filter((fact) =>
+                    ["installed_version", "target_version"].includes(fact.id)).map((fact) => (
+                    <li key={fact.id}>{humanize(fact.id)}: {String(fact.value)}</li>
+                  ))}
+                </ul>
+              </>
+            ) : <p>{evaluation.model_judgment.reason}</p>}
+          </details>
+        )}
+        {!!evaluation.verification_commands?.length && (
+          <details className="compat-passed">
+            <summary>Read-only commands to confirm on the host ({evaluation.verification_commands.length})</summary>
+            <pre className="compat-commands">{evaluation.verification_commands.join("\n")}</pre>
+          </details>
+        )}
+      </div>
+    </details>
+  );
+}
+
 function CompatibilitySection({ compatibility }) {
   if (!compatibility) return null;
   const evaluations = compatibility.evaluations || [];
+  const status = String(compatibility.status || "").toLowerCase();
+  const toReview = evaluations.reduce((sum, evaluation) =>
+    sum + (evaluation.checks || []).filter((check) => check.status !== "PASS").length, 0);
   return (
-    <section className="compatibility-section">
-      <div className="result-title-row">
+    <details className={`compatibility-section compat-${status}`}>
+      <summary className="compat-summary">
+        <ChevronRight size={17} className="compat-chevron" />
         <h3>Compatibility check</h3>
-        <span className={`compatibility compatibility-${String(compatibility.status).toLowerCase()}`}>
-          {humanize(compatibility.status)}
+        <span className={`compatibility compatibility-${status}`}>{humanize(compatibility.status)}</span>
+        <span className="compat-tally">
+          {evaluations.length} fix{evaluations.length === 1 ? "" : "es"} checked
+          {toReview ? ` · ${toReview} item${toReview === 1 ? "" : "s"} to review` : ""}
+          {compatibility.host ? ` · ${compatibility.host}` : ""}
         </span>
+      </summary>
+      <div className="compat-body">
+        <p className="compat-lead">{compatibility.error || compatibility.summary}
+          {compatibility.computed_after_run ? " Checked against the current inventory after this run." : ""}</p>
+        {evaluations.map((evaluation, index) => (
+          <CompatibilityEvaluation key={`${evaluation.role}-${evaluation.target}-${index}`}
+            evaluation={evaluation} open={index === 0} />
+        ))}
       </div>
-      <p>{compatibility.error || compatibility.summary}
-        {compatibility.host ? ` Host: ${compatibility.host}.` : ""}
-        {compatibility.computed_after_run ? " Checked against the current inventory after this run." : ""}</p>
-      {evaluations.map((evaluation, index) => {
-        const flagged = (evaluation.checks || []).filter((check) => check.status !== "PASS");
-        const passed = (evaluation.checks || []).length - flagged.length;
-        return (
-          <article className="compatibility-eval" key={`${evaluation.role}-${evaluation.target}-${index}`}>
-            <div className="compatibility-eval-heading">
-              <div>
-                <strong>{COMPATIBILITY_ROLES[evaluation.role] || humanize(evaluation.role)}: {evaluation.target || "no target"}</strong>
-                <small>{evaluation.component} · installed {evaluation.installed_version || "unknown"} · {humanize(evaluation.ownership)}</small>
-              </div>
-              <span className={`compatibility compatibility-${String(evaluation.status).toLowerCase()}`}>
-                {humanize(evaluation.status)}
-              </span>
-            </div>
-            <ul className="compatibility-checks">
-              {flagged.map((check) => (
-                <li key={check.id + check.detail}>
-                  <span className={`check-${check.status.toLowerCase()}`}>{check.status}</span>
-                  <div><strong>{humanize(check.id)}:</strong> {check.detail}</div>
-                </li>
-              ))}
-            </ul>
-            {passed > 0 && (
-              <details className="compatibility-passed" open={!flagged.length}>
-                <summary>Why this version fits: {passed} check(s) passed</summary>
-                <ul className="compatibility-checks">
-                  {(evaluation.checks || []).filter((check) => check.status === "PASS").map((check) => (
-                    <li key={check.id + check.detail}>
-                      <span className="check-pass">PASS</span>
-                      <div><strong>{humanize(check.id)}:</strong> {check.detail}</div>
-                    </li>
-                  ))}
-                </ul>
-              </details>
-            )}
-            <AppliedRules rules={evaluation.applied_rules} productKey={evaluation.product_rules} target={evaluation.target} />
-            {evaluation.model_judgment && (
-              <details>
-                <summary>Model judgment: {evaluation.model_judgment.validation === "accepted"
-                  ? humanize(evaluation.model_judgment.model_status)
-                  : evaluation.model_judgment.validation === "no_rules"
-                    ? "no matching knowledge rule"
-                    : "rejected; inventory checks retained"}</summary>
-                {evaluation.model_judgment.validation === "accepted" ? (
-                  <>
-                    <p>Rule and fact references were checked. Final status: {humanize(evaluation.model_judgment.status)}.</p>
-                    <ul>
-                      {(evaluation.model_judgment.cited_rules || []).map((rule) => (
-                        <li key={rule.id}>{rule.id}: {typeof rule.value === "string"
-                          ? rule.value : JSON.stringify(rule.value)}{rule.source && /^https?:\/\//.test(rule.source)
-                          ? <> · <a href={rule.source} target="_blank" rel="noreferrer">Source</a></> : null}</li>
-                      ))}
-                      {(evaluation.model_judgment.cited_facts || []).filter((fact) =>
-                        ["installed_version", "target_version"].includes(fact.id)).map((fact) => (
-                        <li key={fact.id}>{humanize(fact.id)}: {String(fact.value)}</li>
-                      ))}
-                    </ul>
-                  </>
-                ) : <p>{evaluation.model_judgment.reason}</p>}
-              </details>
-            )}
-            <GuidanceList title="Required actions" items={evaluation.required_actions} tone="warning" />
-            {!!evaluation.verification_commands?.length && (
-              <details>
-                <summary>Read-only verification commands ({evaluation.verification_commands.length})</summary>
-                <GuidanceList title="Run on the host to confirm" items={evaluation.verification_commands} />
-              </details>
-            )}
-          </article>
-        );
-      })}
-    </section>
+    </details>
   );
 }
 
@@ -1386,18 +1331,6 @@ function RemediationResultCard({ result: savedResult, jobId, onResult }) {
   const [result, setResultState] = useState(savedResult);
   useEffect(() => { setResultState(savedResult); }, [savedResult]);
   const setResult = (next) => { setResultState(next); onResult?.(next); };
-  // A context file uploaded on this card: stored for the server and this CVE re-assessed with it.
-  const applyServerContext = async (text) => {
-    const response = await fetch("/api/compatibility/context", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ run_id: result.run_id, cve: result.cve, component_id: result.component_id,
-        host: result.host || null, text }),
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || `Applying the context failed (HTTP ${response.status}).`);
-    if (data.result) setResult(data.result);
-    return data.context || {};
-  };
   const [currentCompatibility, setCurrentCompatibility] = useState(result.compatibility);
   useEffect(() => { setCurrentCompatibility(result.compatibility); }, [result.compatibility]);
   const lookupSources = uniqueLookupSources(result.lookup_sources);
@@ -1431,9 +1364,7 @@ function RemediationResultCard({ result: savedResult, jobId, onResult }) {
           </div>
           <strong>{result.product}</strong>
           <div className="context-chips">
-            {result.run_id && <span>Run {result.run_id}</span>}
             {result.host && <span className="server-chip">Server {result.host}</span>}
-            {result.component_id && <span>Component ID {result.component_id}</span>}
             {context.filter(Boolean).map((item, index) => <span key={`${item}-${index}`}>{item}</span>)}
           </div>
         </div>
@@ -1452,9 +1383,7 @@ function RemediationResultCard({ result: savedResult, jobId, onResult }) {
       {result.host && result.context_missing && (
         <section className="server-context-callout">
           <h3>Context for {result.host} has not been collected</h3>
-          <p>This CVE was assessed once, on {result.host}, without its installed versions. {SCRIPT_HELP} Then run
-            remediation for this component again, or upload the output (or an inventory YAML) here: this CVE is re-assessed with it.</p>
-          <ServerContextActions server={result.host} jobId={jobId} onApply={applyServerContext} />
+          <p>This CVE was assessed on {result.host} without its installed versions.</p>
         </section>
       )}
 
@@ -1462,23 +1391,16 @@ function RemediationResultCard({ result: savedResult, jobId, onResult }) {
         <section className="server-context-callout">
           <h3>{result.host}: assessed with the central baseline</h3>
           <p>No context has been collected for {result.host}, so its versions come from the central baseline
-            (the organisation's observed middleware build), not from the server itself. {SCRIPT_HELP} Upload the
-            output (or an inventory YAML) here and this CVE is re-assessed with the server's own versions.</p>
-          <ServerContextActions server={result.host} jobId={jobId} onApply={applyServerContext} />
+            (the organisation's observed middleware build), not from the server itself.</p>
         </section>
       )}
 
       {result.other_hosts?.length > 0 && (
         <details className="server-context-others">
           <summary>Also found on {result.other_hosts.length} other server{result.other_hosts.length === 1 ? "" : "s"}
-            {" "}(not assessed separately; collect a server's context to check it)</summary>
+            {" "}(not assessed separately)</summary>
           <ul className="server-list">
-            {result.other_hosts.map((server) => (
-              <li key={server}>
-                <div><strong>{server}</strong></div>
-                <ServerContextActions server={server} jobId={jobId} />
-              </li>
-            ))}
+            {result.other_hosts.map((server) => <li key={server}><div><strong>{server}</strong></div></li>)}
           </ul>
         </details>
       )}
@@ -1542,8 +1464,7 @@ function RemediationResultCard({ result: savedResult, jobId, onResult }) {
               installations={result.installation_fixes} compatibility={currentCompatibility} />
           )}
 
-          <CardServerContext item={result} compatibility={currentCompatibility} onChecked={setCurrentCompatibility}
-            onResult={setResult} />
+          <CardServerContext item={result} compatibility={currentCompatibility} onChecked={setCurrentCompatibility} />
 
           <CompatibilityRuleRequest compatibility={currentCompatibility} result={result}
             onChecked={setCurrentCompatibility} />
@@ -1890,8 +1811,59 @@ const HISTORY_FILTERS = [
   { id: "without", label: "Not fixed before" },
 ];
 
-function GroupedTable({ columns, rows, selected, setSelected, history, historyStatus, onViewHistory }) {
+const CVE_PATTERN = /CVE-\d{4}-\d{4,}/gi;
+const splitList = (value) => String(value || "").split("|").map((v) => v.trim()).filter(Boolean);
+
+// CVE -> the middleware systems (Application column), operating systems and servers the
+// enriched rows (one per CVE) name it under.
+function cveMiddlewareIndex(rows) {
+  const index = new Map();
+  for (const row of rows || []) {
+    for (const cve of String(row["CVE IDs"] || "").match(CVE_PATTERN) || []) {
+      const key = cve.toUpperCase();
+      const entry = index.get(key) || { apps: new Set(), os: new Set(), hosts: new Set() };
+      splitList(row.Application).forEach((name) => entry.apps.add(name));
+      splitList(row["Operating System"]).forEach((name) => entry.os.add(name));
+      splitList(row.Hostname).forEach((name) => entry.hosts.add(name.toLowerCase()));
+      index.set(key, entry);
+    }
+  }
+  return index;
+}
+
+function CveMiddlewareDropdown({ cve, row, info, colSpan, onClose }) {
+  // Without the enriched rows, fall back to the group's own (merged) application list.
+  const apps = info ? [...info.apps] : splitList(row.Application);
+  const os = info ? [...info.os] : splitList(row["Operating System"]);
+  apps.sort((a, b) => a.localeCompare(b));
+  return (
+    <tr className="cve-dropdown-row">
+      <td colSpan={colSpan}>
+        <div className="cve-dropdown" onClick={(event) => event.stopPropagation()}>
+          <div className="cve-dropdown-head">
+            <Server size={15} />
+            <strong>{cve}</strong>
+            <span>found under {apps.length} middleware system{apps.length === 1 ? "" : "s"}
+              {info?.hosts.size ? ` on ${info.hosts.size} server${info.hosts.size === 1 ? "" : "s"}` : ""}</span>
+            <button type="button" className="cve-dropdown-close" aria-label="Close" onClick={onClose}><X size={14} /></button>
+          </div>
+          {apps.length ? (
+            <ul className="cve-dropdown-list">
+              {apps.map((name) => <li key={name}>{name}</li>)}
+            </ul>
+          ) : <p className="empty">No middleware system is named for this CVE.</p>}
+          {os.length > 0 && <p className="cve-dropdown-os">Operating systems: {os.join(", ")}</p>}
+          {!info && <p className="cve-dropdown-os">Shown for the whole group: the per-CVE list was not loaded.</p>}
+        </div>
+      </td>
+    </tr>
+  );
+}
+
+function GroupedTable({ columns, rows, selected, setSelected, history, historyStatus, onViewHistory, cveIndex }) {
   const [historyFilter, setHistoryFilter] = useState("all");
+  // The CVE whose middleware dropdown is open: { index, cve }.
+  const [openCve, setOpenCve] = useState(null);
   const extra = useCallback((_row, index) => historyFilter === "all"
     || (historyFilter === "with" ? Boolean(history[index]) : !history[index]), [historyFilter, history]);
   const filter = useTableFilter(columns, rows, extra);
@@ -1964,9 +1936,10 @@ function GroupedTable({ columns, rows, selected, setSelected, history, historySt
           <tbody>
             {paging.visible.length ? paging.visible.map(({ row, index }) => {
               const past = history[index];
+              const open = openCve?.index === index ? openCve.cve : null;
               return (
+                <Fragment key={`${row.Product}-${row.Component}-${index}`}>
                 <tr
-                  key={`${row.Product}-${row.Component}-${index}`}
                   className={`${selected.has(index) ? "is-selected" : ""} ${past ? "has-history" : ""}`}
                   onClick={() => toggle(index)}
                 >
@@ -1983,7 +1956,7 @@ function GroupedTable({ columns, rows, selected, setSelected, history, historySt
                   <td className="history-column">
                     {past ? (
                       <button type="button" className="history-badge"
-                        title={`Fix found in run ${past.fixes[0].run_id}. Click to view it.`}
+                        title="A saved run found a fix. Click to view it."
                         onClick={(event) => {
                           event.stopPropagation();
                           onViewHistory(index);
@@ -1995,12 +1968,32 @@ function GroupedTable({ columns, rows, selected, setSelected, history, historySt
                       <span className="history-pending"><LoaderCircle className="spin" size={12} /> Checking</span>
                     ) : <span className="empty">-</span>}
                   </td>
-                  {columns.map((column) => (
-                    <td key={column} title={String(row[column] ?? "")}>
-                      {String(row[column] ?? "") || <span className="empty">-</span>}
-                    </td>
-                  ))}
+                  {columns.map((column) => {
+                    const text = String(row[column] ?? "");
+                    const cves = column === "CVE IDs" ? [...new Set((text.match(CVE_PATTERN) || []).map((c) => c.toUpperCase()))] : [];
+                    return (
+                      <td key={column} title={text} className={cves.length ? "cve-cell" : undefined}>
+                        {cves.length ? cves.map((cve) => (
+                          <button key={cve} type="button"
+                            className={`cve-link ${open === cve ? "active" : ""}`}
+                            title={`Show the middleware systems ${cve} is found under`}
+                            aria-expanded={open === cve}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setOpenCve(open === cve ? null : { index, cve });
+                            }}>
+                            {cve}
+                          </button>
+                        )) : text || <span className="empty">-</span>}
+                      </td>
+                    );
+                  })}
                 </tr>
+                {open && (
+                  <CveMiddlewareDropdown cve={open} row={row} info={cveIndex?.get(open)}
+                    colSpan={columns.length + 3} onClose={() => setOpenCve(null)} />
+                )}
+                </Fragment>
               );
             }) : (
               <tr>
@@ -2015,10 +2008,20 @@ function GroupedTable({ columns, rows, selected, setSelected, history, historySt
   );
 }
 
-function DataTable({ columns, rows, emptyMessage }) {
+function DataTable({ columns, rows, emptyMessage, onFilterChange }) {
   const filter = useTableFilter(columns, rows);
   const { entries } = filter;
   const paging = usePaging(entries, `${filter.query}|${JSON.stringify(filter.filters)}`);
+  const active = Boolean(filter.query.trim()) || filter.filters.length > 0;
+
+  // Tell the caller which rows are actually visible, whenever the filter changes: a 1-based
+  // row number per entry, since that's the numbering the "#" column shows, and the numbering
+  // start/count already use. Only reported while a filter is active (null otherwise), so
+  // callers can tell "no filter" apart from "filtered down to these rows".
+  useEffect(() => {
+    if (!onFilterChange) return;
+    onFilterChange(active ? { active: true, rows: entries.map(({ index }) => index + 1) } : { active: false, rows: null });
+  }, [onFilterChange, active, entries]);
 
   return (
     <>
@@ -2063,72 +2066,6 @@ function DataTable({ columns, rows, emptyMessage }) {
 // Download the read-only collection script for one server, and upload what it printed.
 // onApply(text): on a result card, the file is applied to that card instead (stored as the
 // server's context and the CVE re-assessed with it); it returns the stored-context summary.
-function ServerContextActions({ server, jobId, onUploaded, onApply }) {
-  const input = useRef(null);
-  const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState(null);
-  const [failure, setFailure] = useState("");
-
-  async function upload(file) {
-    if (!file) return;
-    setBusy(true);
-    setFailure("");
-    setResult(null);
-    try {
-      if (onApply) {
-        setResult({ ...(await onApply(await file.text())), reassessed: true });
-        return;
-      }
-      const body = new FormData();
-      body.append("file", file);
-      body.append("server", server);
-      body.append("job_id", jobId || "");
-      const response = await fetch("/api/context-upload", { method: "POST", body });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Upload failed.");
-      setResult(data);
-      onUploaded?.(data);
-    } catch (error) {
-      setFailure(error.message);
-    } finally {
-      setBusy(false);
-      if (input.current) input.current.value = "";
-    }
-  }
-
-  return (
-    <div className="server-actions">
-      <div className="server-actions-buttons">
-        <a className="button button-secondary button-small"
-          href={`/api/context-script?server=${encodeURIComponent(server)}&job_id=${encodeURIComponent(jobId || "")}`}>
-          <Download size={14} /> Download script
-        </a>
-        <button type="button" className="button button-primary button-small" disabled={busy}
-          onClick={() => input.current?.click()}>
-          {busy ? <LoaderCircle className="spin" size={14} /> : <UploadCloud size={14} />}
-          {busy ? "Converting…" : "Upload output"}
-        </button>
-        <input ref={input} type="file" accept=".txt,text/plain" hidden onChange={(event) => upload(event.target.files[0])} />
-      </div>
-      {result && (
-        <p className="server-upload-ok">
-          <Check size={13} /> Stored {result.hostname}{result.os ? ` (${result.os})` : ""}: {result.components} components.
-          {" "}{result.database?.message}
-          {result.warnings?.map((warning) => <span key={warning}> {warning}</span>)}
-          {" "}{result.reassessed ? "This CVE was re-assessed with it (card updated)."
-            : "Used by the next remediation run; to update a result already shown, use \"Update server context\" on its card."}
-        </p>
-      )}
-      {failure && <p className="server-upload-error"><AlertTriangle size={13} /> {failure}</p>}
-    </div>
-  );
-}
-
-const SCRIPT_HELP = "Download the collection script for this server's operating system (a shell script, or PowerShell "
-  + "for Windows) and run it on the server as your normal user (no root or administrator rights needed), as its first "
-  + "comment shows; then upload the aegis_context.txt it writes. It only reads (fixed, allowlisted commands), runs at the "
-  + "lowest priority, masks passwords and tokens before printing, and writes nothing on the server except that file.";
-
 function FixHistoryList({ indices, rows, history }) {
   const shown = indices.slice(0, 6);
   return (
@@ -2142,12 +2079,68 @@ function FixHistoryList({ indices, rows, history }) {
               <strong>{row.Product || "Unknown product"} · {row.Component || "Unknown component"}</strong>
               {fix && <span>{fix.cve}{fix.host ? ` on ${fix.host}` : ""} → {fix.target || "fix recorded"}</span>}
             </div>
-            {fix && <small>Run {fix.run_id}{fix.assessed_at ? ` · ${new Date(fix.assessed_at).toLocaleString()}` : ""}</small>}
+            {fix?.assessed_at && <small>Assessed {new Date(fix.assessed_at).toLocaleString()}</small>}
           </li>
         );
       })}
       {indices.length > shown.length && <li className="history-more">and {indices.length - shown.length} more</li>}
     </ul>
+  );
+}
+
+// Middleware systems (Application column, pipe separated) in the chosen grouped rows,
+// with how many of their CVEs are selected.
+function middlewareOptions(indices, rows) {
+  const found = new Map();
+  for (const index of indices) {
+    const row = rows[index] || {};
+    const cves = String(row["CVE IDs"] || "").match(/CVE-\d{4}-\d{4,}/gi) || [];
+    for (const name of String(row.Application || "").split("|").map((v) => v.trim()).filter(Boolean)) {
+      const entry = found.get(name.toLowerCase()) || { name, cves: new Set() };
+      cves.forEach((cve) => entry.cves.add(cve.toUpperCase()));
+      found.set(name.toLowerCase(), entry);
+    }
+  }
+  return [...found.values()]
+    .map((entry) => ({ name: entry.name, cves: entry.cves.size }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// Asked as rows are selected: the middleware systems in the selected rows, all ticked
+// until unticked (excluded holds the unticked names, lower case).
+function MiddlewarePicker({ options, excluded, setExcluded }) {
+  if (!options.length) return null;
+  const chosen = options.filter((option) => !excluded.has(option.name.toLowerCase()));
+  const all = chosen.length === options.length;
+  const toggle = (name) => setExcluded((current) => {
+    const next = new Set(current);
+    const key = name.toLowerCase();
+    if (next.has(key)) next.delete(key); else next.add(key);
+    return next;
+  });
+  return (
+    <div className="middleware-picker">
+      <div className="middleware-picker-head">
+        <Server size={15} />
+        <strong>Which middleware systems do you want to run this for?</strong>
+        <span>{chosen.length} of {options.length} chosen</span>
+      </div>
+      <p>Each chosen system is assessed against its own server context; evidence is fetched once per CVE and shared.</p>
+      <label className="middleware-option middleware-all">
+        <input type="checkbox" checked={all}
+          onChange={() => setExcluded(all ? new Set(options.map((option) => option.name.toLowerCase())) : new Set())} />
+        <span>All {options.length} systems</span>
+      </label>
+      <div className="middleware-list">
+        {options.map((option) => (
+          <label key={option.name} className="middleware-option">
+            <input type="checkbox" checked={!excluded.has(option.name.toLowerCase())} onChange={() => toggle(option.name)} />
+            <span>{option.name}</span>
+            <small>{option.cves} CVE{option.cves === 1 ? "" : "s"}</small>
+          </label>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -2203,8 +2196,8 @@ function UploadPanel({ onUploaded, setError, uploading, setUploading }) {
 
   async function upload(file) {
     if (!file) return;
-    if (!file.name.toLowerCase().endsWith(".csv")) {
-      setError("Choose a CSV file.");
+    if (!/\.(csv|xlsx)$/i.test(file.name)) {
+      setError("Choose a CSV or XLSX file.");
       return;
     }
 
@@ -2235,7 +2228,7 @@ function UploadPanel({ onUploaded, setError, uploading, setUploading }) {
           every original field remains available for review.
         </p>
         <div className="trust-row">
-          <span><ShieldCheck size={17} /> CSV only</span>
+          <span><ShieldCheck size={17} /> CSV or XLSX</span>
           <span><Database size={17} /> 25 MB maximum</span>
         </div>
       </div>
@@ -2257,7 +2250,7 @@ function UploadPanel({ onUploaded, setError, uploading, setUploading }) {
         <input
           ref={inputRef}
           type="file"
-          accept=".csv,text/csv"
+          accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
           hidden
           onChange={(event) => upload(event.target.files[0])}
         />
@@ -2270,13 +2263,13 @@ function UploadPanel({ onUploaded, setError, uploading, setUploading }) {
         ) : (
           <>
             <div className="upload-icon"><UploadCloud size={27} /></div>
-            <strong>Drop your CSV here</strong>
+            <strong>Drop your CSV or XLSX here</strong>
             <span>or select it from your computer</span>
             <button
               className="button button-primary"
               onClick={() => inputRef.current?.click()}
             >
-              Choose CSV
+              Choose file
               <ArrowRight size={17} />
             </button>
           </>
@@ -2289,6 +2282,7 @@ function UploadPanel({ onUploaded, setError, uploading, setUploading }) {
 export default function App() {
   const [dataset, setDataset] = useState(null);
   const [enriched, setEnriched] = useState(null);
+  const cveIndex = useMemo(() => cveMiddlewareIndex(enriched?.rows), [enriched]);
   const [grouped, setGrouped] = useState(null);
   const [view, setView] = useState("workspace");
   // Sidebar page: the CVE workspace (all workflow views) or the context gatherer.
@@ -2296,6 +2290,10 @@ export default function App() {
   const [reusePrompt, setReusePrompt] = useState(false);
   const [reuseFile, setReuseFile] = useState(null);
   const [selectedGroups, setSelectedGroups] = useState(new Set());
+  // Middleware systems the user unticked (lower case); every other one in the selection runs.
+  const [excludedMiddleware, setExcludedMiddleware] = useState(new Set());
+  const middlewareChoices = useMemo(
+    () => middlewareOptions([...selectedGroups], grouped?.rows || []), [selectedGroups, grouped]);
   const [pipelineRun, setPipelineRun] = useState(null);
   const [remediationRuns, setRemediationRuns] = useState([]);
   const remediationResults = useMemo(() => combineRemediationRuns(remediationRuns), [remediationRuns]);
@@ -2322,14 +2320,31 @@ export default function App() {
   const [activeTab, setActiveTab] = useState("deduplicated");
   const [start, setStart] = useState(1);
   const [count, setCount] = useState(10);
+  // Set by the "Unique CVE records" table below whenever a filter there is active: the exact
+  // rows enrichment should run on, so a filtered view and what gets enriched never diverge.
+  // null while no filter is applied (the Start row / Row count range decides it instead).
+  const [filteredRows, setFilteredRows] = useState(null);
+  // Only the "deduplicated" tab's filter decides what gets enriched; a filter left over from
+  // viewing it is stale once the user switches to the "enriched" tab, so it is dropped here.
+  useEffect(() => {
+    if (activeTab !== "deduplicated") setFilteredRows(null);
+  }, [activeTab]);
+  const handleFilterChange = useCallback(
+    (info) => setFilteredRows(info.active ? info.rows : null), []);
   const [uploading, setUploading] = useState(false);
   const [enriching, setEnriching] = useState(false);
   const [error, setError] = useState("");
 
-  const available = dataset ? Math.max(1, dataset.unique_count - start + 1) : 1;
-  const selectedEnd = dataset
-    ? Math.min(dataset.unique_count, start + count - 1)
-    : 0;
+  // Start row / Row count apply the same way whether or not a filter is active: positions
+  // 1..N within whatever set is in play -- the filtered rows when there is a filter, the
+  // full deduplicated set otherwise. "Rows 1-5" with a filter on means the first 5 filtered
+  // rows, not rows 1-5 of the unfiltered file.
+  const rangeTotal = filteredRows ? filteredRows.length : (dataset ? dataset.unique_count : 1);
+  const available = Math.max(1, rangeTotal - start + 1);
+  const selectedEnd = Math.min(rangeTotal, start + count - 1);
+  // The actual row numbers (into job["records"]) the current Start row / Row count select,
+  // resolved against the filtered set when one is active.
+  const selectedRows = filteredRows ? filteredRows.slice(start - 1, start - 1 + count) : null;
 
   const activeData = useMemo(() => {
     if (activeTab === "enriched" && enriched) return enriched;
@@ -2413,7 +2428,7 @@ export default function App() {
     setView("workspace");
     setReusePrompt(false);
     setReuseFile(null);
-    setSelectedGroups(new Set());
+    setSelectedGroups(new Set()); setExcludedMiddleware(new Set());
     setPipelineRun(null);
     setRemediationRuns([]);
     setPreviousFixRuns([]);
@@ -2429,6 +2444,7 @@ export default function App() {
     setActiveTab("deduplicated");
     setStart(1);
     setCount(10);
+    setFilteredRows(null);
     setError("");
   }
 
@@ -2500,7 +2516,7 @@ export default function App() {
       source: result.source,
       source_filename: result.source_filename,
     });
-    setSelectedGroups(new Set());
+    setSelectedGroups(new Set()); setExcludedMiddleware(new Set());
     setPipelineRun(null);
     setActiveTab("enriched");
     setView("grouped");
@@ -2533,7 +2549,11 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(reuse
           ? { job_id: dataset.job_id, filename: reuseFile || dataset.existing_enrichment.filename }
-          : { job_id: dataset.job_id, start, count }),
+          // A filter active on the table above takes over from Start row / Row count, so
+          // what gets enriched always matches what was actually filtered and visible.
+          // Start row / Row count apply within the filtered rows when a filter is active
+          // (selectedRows), same semantics as the unfiltered range otherwise.
+          : { job_id: dataset.job_id, ...(filteredRows ? { rows: selectedRows } : { start, count }) }),
         signal: controller.signal,
       });
       const result = await response.json();
@@ -2551,7 +2571,8 @@ export default function App() {
     }
   }
 
-  // confirmed=false first asks when a selected component already has a saved fix.
+  // confirmed=false first asks when a selected component already has a saved fix. The
+  // middleware systems come from the picker shown as rows are selected.
   async function runSelectedComponents(indices = null, confirmed = false) {
     const chosen = [...(indices || selectedGroups)].sort((a, b) => a - b);
     if (!chosen.length || ["queued", "running"].includes(pipelineRun?.status)) return;
@@ -2561,6 +2582,14 @@ export default function App() {
         setPrompt({ type: "run", fixed, rest: chosen.filter((index) => !fixHistory.byIndex[index]) });
         return;
       }
+    }
+    const options = middlewareOptions(chosen, grouped?.rows || []);
+    const applications = options.map((option) => option.name)
+      .filter((name) => !excludedMiddleware.has(name.toLowerCase()));
+    if (options.length && !applications.length) {
+      setPrompt(null);
+      setError("Choose at least one middleware system to run for.");
+      return;
     }
     setPrompt(null);
     if (indices) setSelectedGroups(new Set(chosen));
@@ -2572,6 +2601,7 @@ export default function App() {
         body: JSON.stringify({
           job_id: dataset.job_id,
           selected_indices: chosen,
+          ...(applications?.length ? { applications } : {}),
         }),
       });
       const result = await response.json();
@@ -2652,11 +2682,14 @@ export default function App() {
             );
           })}
         </ol>}
-        {dataset && page === "workspace" && (
-          <button className="button button-ghost" onClick={reset}>
-            <RefreshCw size={16} /> New file
-          </button>
-        )}
+        <div className="topbar-actions">
+          {dataset && page === "workspace" && (
+            <button className="button button-ghost" onClick={reset}>
+              <RefreshCw size={16} /> New file
+            </button>
+          )}
+          <ThemeToggle />
+        </div>
       </header>
 
       <div className="app-body">
@@ -2675,10 +2708,10 @@ export default function App() {
         </button>
       </nav>
       <main>
-        {/* Kept mounted for the whole session (hidden on other pages), so its servers, uploads,
-            generated scripts and filters stay as they were when the user comes back. */}
+        {/* Kept mounted for the whole session (hidden on other pages), so its uploads and
+            filters stay as they were when the user comes back. */}
         <div hidden={page !== "context_gatherer"}>
-          <ContextGathererView results={remediationResults} jobId={dataset?.job_id}
+          <ApplicationGathererView jobId={dataset?.job_id}
             sourceName={grouped?.source_filename || dataset?.filename}
             enrichedKey={grouped ? `${grouped.filename || ""}:${grouped.rows?.length || 0}` : ""}
             onOpenWorkspace={() => setPage("workspace")} />
@@ -2715,7 +2748,7 @@ export default function App() {
               <div>
                 <button className="back-link" onClick={() => {
                   if (view === "results") {
-                    setSelectedGroups(new Set());
+                    setSelectedGroups(new Set()); setExcludedMiddleware(new Set());
                     setPipelineRun(null);
                   }
                   setVerdictFilter(null);
@@ -2743,10 +2776,6 @@ export default function App() {
                   onClick={openMiddleware}>
                   <Layers3 size={16} /> Middleware delivery
                 </button>
-                <details className="run-identity">
-                  <summary>{displayResults.run_ids.length} remediation run{displayResults.run_ids.length === 1 ? "" : "s"}</summary>
-                  {displayResults.run_ids.map((runId) => <code key={runId}>{runId}</code>)}
-                </details>
               </div>
             </div>
 
@@ -2900,10 +2929,14 @@ export default function App() {
                   </p>
                 </div>
               </div>
+              <MiddlewarePicker options={middlewareChoices} excluded={excludedMiddleware}
+                setExcluded={setExcludedMiddleware} />
               <div className="selection-actions">
                 <button
                   className="button button-primary"
-                  disabled={!selectedGroups.size || ["queued", "running"].includes(pipelineRun?.status)}
+                  disabled={!selectedGroups.size || ["queued", "running"].includes(pipelineRun?.status)
+                    || (middlewareChoices.length > 0
+                      && middlewareChoices.every((option) => excludedMiddleware.has(option.name.toLowerCase())))}
                   onClick={() => runSelectedComponents()}
                 >
                   {["queued", "running"].includes(pipelineRun?.status) ? (
@@ -2923,8 +2956,8 @@ export default function App() {
             {pipelineRun && (
               <section className={`run-status run-status-${pipelineRun.status}`} role="status">
                 <div>
-                  <span className="status-label">Pipeline {pipelineRun.status}</span>
-                  <strong>{pipelineRun.run_id}</strong>
+                  <span className="status-label">Pipeline</span>
+                  <strong>{String(pipelineRun.status || "").replaceAll("_", " ").replace(/^./, (c) => c.toUpperCase())}</strong>
                   <p>
                     {pipelineRun.message || `${pipelineRun.selected_count} selected component groups are queued.`}
                   </p>
@@ -2953,7 +2986,7 @@ export default function App() {
               <div className="table-heading">
                 <div>
                   <h2>Product and component groups</h2>
-                  <p>Every row comes from the current data/grouped_by_comp.csv output.</p>
+                  <p>Every row comes from the grouping saved in the database for this upload.</p>
                 </div>
                 <span className="record-count">{grouped.rows.length} groups</span>
               </div>
@@ -2962,6 +2995,7 @@ export default function App() {
                 rows={grouped.rows}
                 selected={selectedGroups}
                 setSelected={setSelectedGroups}
+                cveIndex={cveIndex}
                 history={fixHistory.byIndex}
                 historyStatus={fixHistory.status}
                 onViewHistory={(index) => setPrompt({ type: "row", index })}
@@ -2974,7 +3008,6 @@ export default function App() {
               <div>
                 <span className="eyebrow">Dataset ready</span>
                 <h1>{dataset.filename}</h1>
-                <div className="run-identity"><span>Run ID</span><code>{dataset.run_id}</code></div>
               </div>
               <div className="metric-row">
                 <div className="metric">
@@ -2997,7 +3030,12 @@ export default function App() {
                 <div className="step-icon"><Play size={19} /></div>
                 <div>
                   <h2>Select records to enrich</h2>
-                  <p>Choose a starting row and the number of unique CVEs to process.</p>
+                  <p>
+                    {filteredRows
+                      ? `A filter is active below (${filteredRows.length} row${filteredRows.length === 1 ? "" : "s"} match): `
+                        + "Start row / Row count apply to that filtered list, the same way they apply to the full list otherwise."
+                      : "Choose a starting row and the number of unique CVEs to process, or filter the table below to pick within exact rows instead."}
+                  </p>
                 </div>
               </div>
 
@@ -3007,16 +3045,16 @@ export default function App() {
                   <input
                     type="number"
                     min="1"
-                    max={dataset.unique_count}
+                    max={rangeTotal}
                     value={start}
                     onChange={(event) => {
                       const next = Math.min(
-                        dataset.unique_count,
+                        rangeTotal,
                         Math.max(1, Number(event.target.value) || 1),
                       );
                       setStart(next);
                       setCount((current) =>
-                        Math.min(current, dataset.unique_count - next + 1),
+                        Math.min(current, rangeTotal - next + 1),
                       );
                     }}
                   />
@@ -3053,8 +3091,8 @@ export default function App() {
                   </button>
                 </div>
                 <div className="selection-summary">
-                  <span>Selected range</span>
-                  <strong>Rows {start}-{selectedEnd}</strong>
+                  <span>{filteredRows ? "Selected range (of the filtered rows)" : "Selected range"}</span>
+                  <strong>Rows {start}-{selectedEnd}{filteredRows ? ` of ${filteredRows.length} filtered` : ""}</strong>
                 </div>
                 <button
                   className="button button-primary run-button"
@@ -3129,9 +3167,11 @@ export default function App() {
                       ? "Original dataset fields are retained without component enrichment."
                       : enriched?.source === "saved_enrichment"
                         ? `Loaded from ${enriched.source_filename}.`
-                        : `Generated from source rows ${enriched?.start}-${
-                            enriched ? enriched.start + enriched.count - 1 : ""
-                          }.`}
+                        : enriched?.rows
+                          ? `Generated from ${enriched.rows.length} filtered source row${enriched.rows.length === 1 ? "" : "s"}.`
+                          : `Generated from source rows ${enriched?.start}-${
+                              enriched ? enriched.start + enriched.count - 1 : ""
+                            }.`}
                   </p>
                 </div>
                 <span className="record-count">{activeData.rows.length} records</span>
@@ -3142,6 +3182,7 @@ export default function App() {
                 columns={activeData.columns}
                 rows={activeData.rows}
                 emptyMessage="No records are available."
+                onFilterChange={activeTab === "deduplicated" ? handleFilterChange : undefined}
               />
             </section>
           </>

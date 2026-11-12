@@ -32,6 +32,8 @@ aegis-cve-evidence/context_gathered/inventory/disabled/
 aegis-cve-evidence/context_gathered/inventory/uploaded/
 # Delivery agent output (committed to the delivery repository instead, AEGIS_DELIVERY_REPO)
 aegis-cve-evidence/delivery/artifacts/
+# Per-middleware repository settings (names of internal repositories)
+aegis-cve-evidence/delivery/middleware_repos.json
 # Answers to compatibility questions (facts about real servers)
 aegis-cve-evidence/compatibility/answers.json
 data/selected_components_ui-*.csv
@@ -79,3 +81,30 @@ aegis-cve-evidence/context_gathered/inventory/sterling_rocky8.yaml
 # Personal batch script (hardcoded CVEs) and the empty root lock file
 aegis-cve-evidence/run_all_cves.ps1
 /package-lock.json
+
+# Application context uploaded through the self-service script (real servers; recreated on upload)
+aegis-cve-evidence/context_gathered/inventory/applications/
+
+# Catch-alls for a fresh deployment: no run data, caches, exports or local databases in git
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.jsonl
+*.db
+*.sqlite
+*.sqlite3
+*.pkl
+**/cache/
+**/.cache/
+**/*_cache/
+**/runs/
+**/output_data/
+**/artifacts/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+*.bak
+*.tmp
+*.swp
